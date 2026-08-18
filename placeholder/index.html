@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <title>Automanic Studio</title>
+  <style>
+    html,
+    body {
+      margin: 0;
+      padding: 0;
+      height: 100%;
+      width: 100%;
+      background: radial-gradient(circle at center, #0b1220 0%, #05070c 100%);
+      overflow: hidden;
+    }
+
+    .stage {
+      height: 100vh;
+      width: 100vw;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .heart {
+      width: min(60vmin, 420px);
+      height: min(60vmin, 420px);
+      filter: drop-shadow(0 0 24px rgba(255, 144, 54, 0.35)) drop-shadow(0 0 60px rgba(255, 144, 54, 0.15));
+      transform-origin: center;
+      animation: beat 3s ease-in-out infinite;
+    }
+
+    @keyframes beat {
+      0% {
+        transform: scale(1);
+      }
+
+      12% {
+        transform: scale(1.12);
+      }
+
+      22% {
+        transform: scale(0.97);
+      }
+
+      32% {
+        transform: scale(1.08);
+      }
+
+      45% {
+        transform: scale(1);
+      }
+
+      100% {
+        transform: scale(1);
+      }
+    }
+
+    .pulse-line {
+      stroke-dasharray: 6 4;
+      animation: dash 3s linear infinite;
+    }
+
+    @keyframes dash {
+      to {
+        stroke-dashoffset: -100;
+      }
+    }
+
+    svg {
+      display: block;
+      width: 100%;
+      height: 100%;
+    }
+  </style>
+</head>
+
+<body>
+  <div class="stage">
+    <div class="heart">
+      <svg viewBox="0 0 200 180" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <clipPath id="heart">
+            <path d="M100,170
+                   C40,120 5,85 5,50
+                   C5,20 28,2 55,2
+                   C75,2 92,14 100,32
+                   C108,14 125,2 145,2
+                   C172,2 195,20 195,50
+                   C195,85 160,120 100,170 Z" />
+          </clipPath>
+          <linearGradient id="pcbBase" x1="0%" y1="0%" x2="100%" y2="100%">
+            <stop offset="0%" stop-color="#2a1608" />
+            <stop offset="100%" stop-color="#150a04" />
+          </linearGradient>
+          <radialGradient id="glowCore" cx="50%" cy="45%" r="60%">
+            <stop offset="0%" stop-color="#ff9036" stop-opacity="0.55" />
+            <stop offset="100%" stop-color="#ff9036" stop-opacity="0" />
+          </radialGradient>
+        </defs>
+        <g clip-path="url(#heart)">
+          <rect x="0" y="0" width="200" height="180" fill="url(#pcbBase)" />
+          <rect x="0" y="0" width="200" height="180" fill="url(#glowCore)" />
+          <g fill="none" stroke="#ff9036" stroke-width="1.4" stroke-linecap="round" opacity="0.9">
+            <path class="pulse-line" d="M10,50 H40 L48,58 H80" />
+            <path class="pulse-line" d="M10,90 H30 L38,82 H70 L78,90 H110" />
+            <path class="pulse-line" d="M15,120 H45 L53,112 H90 L98,120 H130" />
+            <path class="pulse-line" d="M190,50 H160 L152,58 H120" />
+            <path class="pulse-line" d="M190,90 H170 L162,82 H130 L122,90 H100" />
+            <path class="pulse-line" d="M185,120 H155 L147,112 H110 L102,120 H90" />
+            <path d="M100,20 V45" />
+            <path d="M100,45 L88,57 V75" />
+            <path d="M100,45 L112,57 V75" />
+            <path d="M88,75 H60 L52,83" />
+            <path d="M112,75 H140 L148,83" />
+            <path d="M100,75 V100" />
+            <path d="M100,100 L85,115 V135" />
+            <path d="M100,100 L115,115 V135" />
+            <path d="M85,135 H100" />
+            <path d="M115,135 H100" />
+          </g>
+          <g fill="#ff9036">
+            <circle cx="40" cy="50" r="2.4" />
+            <circle cx="80" cy="58" r="2.4" />
+            <circle cx="30" cy="90" r="2.4" />
+            <circle cx="110" cy="90" r="2.4" />
+            <circle cx="45" cy="120" r="2.4" />
+            <circle cx="130" cy="120" r="2.4" />
+            <circle cx="160" cy="50" r="2.4" />
+            <circle cx="120" cy="58" r="2.4" />
+            <circle cx="170" cy="90" r="2.4" />
+            <circle cx="100" cy="90" r="2.4" />
+            <circle cx="155" cy="120" r="2.4" />
+            <circle cx="90" cy="120" r="2.4" />
+            <circle cx="100" cy="20" r="3" />
+            <circle cx="88" cy="57" r="2" />
+            <circle cx="112" cy="57" r="2" />
+            <circle cx="52" cy="83" r="2" />
+            <circle cx="148" cy="83" r="2" />
+            <circle cx="85" cy="115" r="2" />
+            <circle cx="115" cy="115" r="2" />
+            <circle cx="100" cy="135" r="3" />
+          </g>
+          <g stroke="#ff9036" stroke-width="0.3" opacity="0.15">
+            <path d="M0,10 H200 M0,30 H200 M0,70 H200 M0,110 H200 M0,150 H200 M0,170 H200" />
+            <path d="M20,0 V180 M60,0 V180 M100,0 V180 M140,0 V180 M180,0 V180" />
+          </g>
+        </g>
+        <path d="M100,170
+               C40,120 5,85 5,50
+               C5,20 28,2 55,2
+               C75,2 92,14 100,32
+               C108,14 125,2 145,2
+               C172,2 195,20 195,50
+               C195,85 160,120 100,170 Z" fill="none" stroke="#ff9036" stroke-width="2" opacity="0.8" />
+      </svg>
+    </div>
+  </div>
+</body>
+</html>
