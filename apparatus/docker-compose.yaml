@@ -1,0 +1,23 @@
+services:
+
+  orchestrator-claude:
+    build:
+      context: ../harness/services/orchestrator/claude
+    environment:
+      AGENT_API_KEY: ${ANTHROPIC_API_KEY:?ANTHROPIC_API_KEY is required}
+      AGENT_MODEL: ${CLAUDE_MODEL:-}
+    ports:
+      - "7000:8000"
+
+  feedback-discord:
+    build:
+      context: ../harness/services/feedback/discord
+    environment:
+      SECRET_KEY: ${DISCORD_BOT_KEY:?DISCORD_BOT_KEY is required}
+      CHANNEL_ID: ${DISCORD_CHANNEL:?DISCORD_CHANNEL is required}
+      ROBOT_NAME: ${POSTING_AS_NAME:?POSTING_AS_NAME is required}
+      ENDPOINT_URL: http://feedback-discord:8000/mcp
+      MESSAGES_URL: http://orchestrator-claude:8000/messages
+      REGISTRY_URL: http://orchestrator-claude:8000/registry
+    ports:
+      - "7001:8000"
