@@ -1,8 +1,10 @@
-__pycache__/
-working/
-build/
-dist/
-.pytest_cache/
+__pycache__
+working
+build
+dist
+.pytest_cache
 .python-version
 .env
 .venv
+.claude
+.mcp.json
