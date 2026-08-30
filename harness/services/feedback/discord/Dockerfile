@@ -11,6 +11,9 @@ RUN pip install --no-cache-dir --root-user-action=ignore --upgrade pip && pip in
 
 COPY service.py .
 
+RUN useradd --create-home --shell /usr/sbin/nologin service && chown -R service:service /service
+USER service
+
 EXPOSE 8000
 
 ENTRYPOINT ["python", "service.py"]

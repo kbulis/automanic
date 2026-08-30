@@ -1,6 +1,7 @@
 # Orchestrator Claude
 
-Orchestration server for managing autonoumous agents and context.
+Orchestration server for managing autonoumous agents and context. Uses
+anthropic api with managed context and tooling.
 
 ## What it does
 

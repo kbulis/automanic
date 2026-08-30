@@ -195,6 +195,16 @@ class Agent:
                     "why",
                 ]
             },
+        }, {
+            "name": "help-ping",
+            "description": """
+                Health check. Returns "ok" when the service is up.
+            """,
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                },
+            },
         }]
 
         while True:
@@ -234,78 +244,116 @@ class Agent:
                     "content": message.content,
                 })
 
+                await self._post_to_tool(
+                    tool_name="mark_as_queuing",
+                    role="feedback",
+                    arguments={
+                        "message_id": message.message_id,
+                    },
+                    session_id=message.session_id,
+                )
+
                 looping = True
 
                 while looping:
-                    response = await self._api.messages.create(
-                        model=self.model,
-                        max_tokens=8192,
-                        system=f"""
-                            You are a long-lived, general-purpose agent that can research,
-                            write code, run commands, and use connected tools to complete
-                            the user's task end to end. When you respond, brevity is very
-                            valuable; be brief and concise.
-                            If you find that you need tools to accomplish a request, but
-                            are unable to identify one, use help-request_feature.
-                            Format agent responses as markdown (sans tables).
-                            """,
-                        thinking={
-                            "type": "adaptive",
-                            "display": "summarized",
-                        },
-                        tools=tools + helps,
-                        messages=context.history,
-                    )
-
-                    context.write_tokens += response.usage.output_tokens
-                    context.input_tokens += response.usage.input_tokens
-
-                    results = []
                     answers = []
 
-                    for block in response.content:
-                        if block.type == "tool_use":
-                            if not block.name.startswith("help-"):
-                                result = await self._post_to_tool(
-                                    session_id=message.session_id,
-                                    full_name=block.name,
-                                    arguments=block.input,
-                                )
-                                results.append({
-                                    "type": "tool_result",
-                                    "tool_use_id": block.id,
-                                    "content": [{
-                                        "type": "text",
-                                        "text": c.text
-                                    } for c in result.content if c.type == "text"],
-                                    "is_error": result.is_error,
-                                })
-                            else:
-                                results.append({
-                                    "type": "tool_result",
-                                    "tool_use_id": block.id,
-                                    "content": "acknowledged and noted",
-                                })
-                            answers.append({
-                                "type": "tool",
-                                "name": block.name,
-                                "params": block.input,
-                            })
-                        if block.type == "thinking":
-                            answers.append({
-                                "type": "idea",
-                                "text": block.thinking,
-                            })
-                        if block.type == "text":
-                            answers.append({
-                                "type": "text",
-                                "text": block.text,
-                            })
+                    try:
+                        response = await self._api.messages.create(
+                            model=self.model,
+                            max_tokens=8192,
+                            system=f"""
+                                You are a long-lived, general-purpose agent that can research,
+                                write code, run commands, and use connected tools to complete
+                                the user's task end to end. When you respond, brevity is very
+                                valuable; be brief and concise.
+                                When you check tools for connectivity and status, note that
+                                tooling will be logically grouped by prefix (tools prefixed
+                                the same should be considered a group). If a group has a ping
+                                tool, use that to assess status and connectivity.
+                                If you find that you need tools to accomplish a request, but
+                                are unable to identify one, use help-request_feature.
+                                Format agent responses as markdown (sans tables).
+                                """,
+                            thinking={
+                                "type": "adaptive",
+                                "display": "summarized",
+                            },
+                            tools=tools + helps,
+                            messages=context.history,
+                        )
 
-                    context.history.append({
-                        "role": response.role,
-                        "content": response.content,
-                    })
+                        context.write_tokens += response.usage.output_tokens
+                        context.input_tokens += response.usage.input_tokens
+
+                        results = []
+
+                        for block in response.content:
+                            if block.type == "tool_use":
+                                if not block.name.startswith("help-"):
+                                    result = await self._post_to_tool(
+                                        session_id=message.session_id,
+                                        full_name=block.name,
+                                        arguments=block.input,
+                                    )
+                                    results.append({
+                                        "type": "tool_result",
+                                        "tool_use_id": block.id,
+                                        "content": [{
+                                            "type": "text",
+                                            "text": c.text
+                                        } for c in result.content if c.type == "text"],
+                                        "is_error": result.is_error,
+                                    })
+                                else:
+                                    results.append({
+                                        "type": "tool_result",
+                                        "tool_use_id": block.id,
+                                        "content": "ok",
+                                    })
+                                answers.append({
+                                    "type": "tool",
+                                    "name": block.name,
+                                    "params": block.input,
+                                })
+                            if block.type == "thinking":
+                                answers.append({
+                                    "type": "idea",
+                                    "text": block.thinking,
+                                })
+                            if block.type == "text":
+                                answers.append({
+                                    "type": "text",
+                                    "text": block.text,
+                                })
+
+                        if response.stop_reason == "end_turn":
+                            looping = False
+
+                        context.history.append({
+                            "role": response.role,
+                            "content": response.content,
+                        })
+
+                        if results:
+                            context.history.append({
+                                "role": "user",
+                                "content": results,
+                            })
+                        else:
+                            looping = False
+
+                    except anthropic.APIError as eX:
+                        error_message = eX.message
+                        if isinstance(eX.body, dict):
+                            error = eX.body.get("error")
+                            if isinstance(error, dict) and error.get("message"):
+                                error_message = error["message"]
+                        answers.append({
+                            "type": "fail",
+                            "text": error_message,
+                        })
+                        looping = False
 
                     if answers:
                         await self._post_to_tool(
@@ -322,16 +370,14 @@ class Agent:
                             },
                         )
 
-                    if results:
-                        context.history.append({
-                            "role": "user",
-                            "content": results,
-                        })
-                    else:
-                        looping = False
-
-                    if response.stop_reason == "end_turn":
-                        looping = False
+                await self._post_to_tool(
+                    tool_name="mark_as_handled",
+                    role="feedback",
+                    arguments={
+                        "message_id": message.message_id,
+                    },
+                    session_id=message.session_id,
+                )
 
 @contextlib.asynccontextmanager
 async def lifespan(app: fastapi.FastAPI):

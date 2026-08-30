@@ -43,7 +43,10 @@ Add this service entry with your env variables mapped:
 ```yaml
 services:
 
-  feedback-discord:
+  orchestrator:
+    ...
+
+  feedback:
     image: automanic/feedback-discord:latest
     environment:
       SERVICE_NAME: feedback-discord
@@ -51,9 +54,9 @@ services:
       SECRET_KEY: ${DISCORD_BOT_KEY:?DISCORD_BOT_KEY is required}
       CHANNEL_ID: ${DISCORD_CHANNEL:?DISCORD_CHANNEL is required}
       ROBOT_NAME: ${POSTING_AS_NAME:?POSTING_AS_NAME is required}
-      ENDPOINT_URL: http://feedback-discord:8000/mcp
-      MESSAGES_URL: http://orchestrator-claude:8000/messages
-      REGISTRY_URL: http://orchestrator-claude:8000/registry
+      ENDPOINT_URL: http://feedback:8000/mcp
+      MESSAGES_URL: http://orchestrator:8000/messages
+      REGISTRY_URL: http://orchestrator:8000/registry
     ports:
       - "7001:8000"
 ```

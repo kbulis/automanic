@@ -19,6 +19,7 @@
       height: 100vh;
       width: 100vw;
       display: flex;
+      flex-direction: column;
       align-items: center;
       justify-content: center;
     }
@@ -72,6 +73,31 @@
       display: block;
       width: 100%;
       height: 100%;
+    }
+
+    .citations {
+      color: #cbd5e1;
+      font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      max-width: 480px;
+      margin-top: 4rem;
+    }
+
+    .citations ul {
+      margin: 8px 0 0;
+      padding-left: 1.1em;
+    }
+
+    .citations li {
+      margin-bottom: 6px;
+    }
+
+    .citations a {
+      color: #ff9036;
+      text-decoration: none;
+    }
+
+    .citations a:hover {
+      text-decoration: underline;
     }
   </style>
 </head>
@@ -155,6 +181,14 @@
                C172,2 195,20 195,50
                C195,85 160,120 100,170 Z" fill="none" stroke="#ff9036" stroke-width="2" opacity="0.8" />
       </svg>
+    </div>
+    <div class="citations">
+      Thoughts on autonomous agentic development:
+      <ul>
+        <li><a href="https://martinfowler.com/articles/exploring-gen-ai/sdd-3-tools.html" target="_blank" rel="noopener">Böckeler, Birgitta (Thoughtworks): "Tools for Spec-Driven Development"</a></li>
+        <li><a href="https://github.blog/ai-and-ml/generative-ai/spec-driven-development-with-ai-get-started-with-a-new-open-source-toolkit/" target="_blank" rel="noopener">Delimarsky, Den (GitHub Blog): "Spec-Driven Development With AI: Get Started With a New Open Source Toolkit"</a></li>
+        <li><a href="https://martinfowler.com/articles/exploring-gen-ai/humans-and-agents.html" target="_blank" rel="noopener">Morris, Kief (Thoughtworks): "Humans and Agents"</a></li>
+      </ul>
     </div>
   </div>
 </body>

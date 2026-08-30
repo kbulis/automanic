@@ -1,13 +1,15 @@
+import typing
 import os
 import sys
 import time
 import json
+import urllib.parse
 import asyncio
 import threading
+import contextlib
 import textwrap
 import requests
 import logging
-import typing
 import discord
 import mcp.server.mcpserver
 
@@ -84,7 +86,7 @@ intents.message_content = True
 client = discord.Client(intents=intents)
 
 @client.event
-async def on_message(message):
+async def on_message(message: discord.Message):
     if not message or repr(message.channel.id) != channel_id:
         return
     if message.author == client.user:
@@ -128,91 +130,22 @@ class IdeaPart(typing.TypedDict):
     type: typing.Literal["idea"]
     text: str
 
+class FailPart(typing.TypedDict):
+    type: typing.Literal["fail"]
+    text: str
+
 class ToolPart(typing.TypedDict):
     type: typing.Literal["tool"]
     name: str
     params: dict[str, object]
 
 class Message(typing.TypedDict):
-    parts: list[TextPart | IdeaPart | ToolPart]
+    parts: list[TextPart | IdeaPart | FailPart | ToolPart]
 
-@mcp.tool()
-def post_to_channel(session_id: str, message: Message, requesting_feedback: bool = False) -> ChannelPostResult:
-    """
-    Post a message of markdown parts to the configured Discord channel to
-    notify channel participants or ask them a question. If asking a question,
-    the agent should include the available response options directly in the
-    markdown content.
-
-    Args:
-        session_id: Durable context correlation id for linking feedback.
-        message: Envelope {parts: [...]} wrapping an ordered list of parts
-            assembled into a single posted message, each rendered according
-            to its type:
-                {type: "text", text: str}: plain markdown, shown as-is
-                {type: "idea", text: str}: wrapped in italics
-                {type: "tool", name: str, params: dict}: rendered as a
-                    name(params) call inside a code block
-            The message may contain a notification, question, context, and
-            response options. Keep the complete interaction prompt within
-            this single list of parts. Limit combined text body length to
-            1024 characters.
-        requesting_feedback: If true, indicates that the posted message is
-            requesting a response from channel participants. A separate
-            feedback-processing thread will monitor the channel and queue
-            responses associated with this request. If false, the message is
-            informational and no feedback should be collected.
-
-    Returns:
-        The message_id of the posted message with the target channel_id;
-        together to be used as a correlation key for subsequent feedback
-        from a user communicating in the configured channel.
-        On exception, error reason will be raised as runtime error.
-    """
-
-    timeout_seconds = 15
-
-    body = "..."
-
-    if message.get("parts"):
-        body = ""
-        for part in message["parts"]:
-            if part["type"] == "tool":
-                content = f"```\n{part['name']}\n{json.dumps(part.get('params', {}), indent=2)}\n```"
-            else:
-                content = part.get("text").strip() if part.get("text") else ""
-                if part["type"] == "idea":
-                    content = "\n".join(f"> {line}" for line in f"*{content}*".split("\n"))
-            body += ("\n\n" if body else "") + content
-
-    if requesting_feedback:
-        body += "\n\n?"
-
+@contextlib.contextmanager
+def api_error_wrapper():
     try:
-        response = requests.post(
-            url=f"https://discord.com/api/v10/channels/{channel_id}/messages",
-            headers={
-                "Authorization": f"Bot {secret_key}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "content": f"🤖 **{robot_name}**:\n\n{body}\n",
-            },
-            timeout=timeout_seconds,
-        )
-
-        response.raise_for_status()
-        result = response.json()
-
-        mapping.set(
-            message_id=result["id"],
-            session_id=session_id
-        )
-
-        return {
-            "message_id": result["id"],
-            "channel_id": channel_id,
-        }
+        yield
     except requests.exceptions.HTTPError as eX:
         if eX.response:
             if eX.response.status_code == 400:
@@ -244,12 +177,140 @@ def post_to_channel(session_id: str, message: Message, requesting_feedback: bool
         )
     except requests.exceptions.Timeout:
         raise RuntimeError(
-            f"Failed to respond within {timeout_seconds} seconds. Wait before retrying.",
+            f"Failed to respond within allotted time. Wait before retrying.",
         )
     except requests.exceptions.RequestException:
         raise RuntimeError(
             "Failed to communicate with server. Check network connectivity and try again.",
         )
+
+@mcp.tool()
+def post_to_channel(session_id: str, message: Message) -> ChannelPostResult:
+    """
+    Post a message of markdown parts to the configured Discord channel to
+    notify channel participants or ask them a question.
+
+    Args:
+        session_id: Durable context correlation id for linking feedback.
+        message: Envelope {parts: [...]} wrapping an ordered list of parts
+            assembled into a single posted message, each rendered according
+            to its type:
+                {type: "text", text: str}: plain markdown, shown as-is
+                {type: "idea", text: str}: wrapped in italics
+                {type: "fail", text: str}: error wrapped in block
+                {type: "tool", name: str, params: dict}: rendered as a
+                    name(params) call inside a code block
+            The message may contain a notification, question, context, and
+            response options. Keep the complete interaction prompt within
+            this single list of parts. Limit combined text body length to
+            1024 characters.
+
+    Returns:
+        The message_id of the posted message with the target channel_id;
+        together to be used as a correlation key for subsequent feedback
+        from a user communicating in the configured channel.
+        On exception, error reason will be raised as runtime error.
+    """
+
+    timeout_seconds = 15
+
+    body = "..."
+
+    if message.get("parts"):
+        body = ""
+        for part in message["parts"]:
+            if part["type"] == "tool":
+                content = f"```\n{part['name']}\n{json.dumps(part.get('params', {}), indent=2)}\n```"
+            else:
+                content = part.get("text").strip() if part.get("text") else ""
+                if part["type"] == "idea":
+                    content = "\n".join(f"> {line}" for line in f"*{content}*".split("\n"))
+                if part["type"] == "fail":
+                    content = f"> 🌋 {content}"
+            body += ("\n\n" if body else "") + content
+
+    with api_error_wrapper():
+        response = requests.post(
+            url=f"https://discord.com/api/v10/channels/{channel_id}/messages",
+            headers={
+                "Authorization": f"Bot {secret_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "content": f"🤖 **{robot_name}**:\n\n{body}\n",
+            },
+            timeout=timeout_seconds,
+        )
+
+        response.raise_for_status()
+        result = response.json()
+
+        mapping.set(
+            message_id=result["id"],
+            session_id=session_id
+        )
+
+        return {
+            "message_id": result["id"],
+            "channel_id": channel_id,
+        }
+
+@mcp.tool()
+def mark_as_queuing(session_id: str, message_id: str):
+    """
+    React to a posted message with reaction to indicate the agent is
+    working on a response, so channel participants know their message
+    or reply was received and is being processed.
+
+    Args:
+        session_id: Durable context correlation id (unused, but always
+            supplied by the caller alongside every tool invocation).
+        message_id: The id of the message to react to, as returned by
+            post_to_channel or captured from an incoming message.
+
+    On exception, error reason will be raised as a runtime error.
+    """
+
+    timeout_seconds = 15
+
+    with api_error_wrapper():
+        response = requests.put(
+            url=f"https://discord.com/api/v10/channels/{channel_id}/messages/{message_id}/reactions/{urllib.parse.quote('🕶️')}/@me",
+            headers={
+                "Authorization": f"Bot {secret_key}",
+            },
+            timeout=timeout_seconds,
+        )
+        response.raise_for_status()
+
+@mcp.tool()
+def mark_as_handled(session_id: str, message_id: str):
+    """
+    Remove the reaction previously added by mark_as_queuing, once a
+    response to the message has been posted, to signal processing is
+    done.
+
+    Args:
+        session_id: Durable context correlation id (unused, but always
+            supplied by the caller alongside every tool invocation).
+        message_id: The id of the message to clear the reaction from, as
+            returned by post_to_channel or captured from an incoming
+            message.
+
+    On exception, error reason will be raised as a runtime error.
+    """
+
+    timeout_seconds = 15
+
+    with api_error_wrapper():
+        response = requests.delete(
+            url=f"https://discord.com/api/v10/channels/{channel_id}/messages/{message_id}/reactions/{urllib.parse.quote('🕶️')}/@me",
+            headers={
+                "Authorization": f"Bot {secret_key}",
+            },
+            timeout=timeout_seconds,
+        )
+        response.raise_for_status()
 
 @mcp.tool()
 def ping() -> str:
@@ -268,12 +329,14 @@ def add_to_registry(name: str, role: str, endpoint: str, url: str, port: int):
 
     while time.monotonic() < deadline:
         try:
-            requests.get(url=f"http://localhost:{port}/", timeout=2)
+            requests.get(url=f"http://localhost:{port}", timeout=2)
             break
         except requests.exceptions.RequestException:
             time.sleep(1)
     else:
         log.warning("~ gave up waiting, continuing with registering")
+
+    time.sleep(1)
 
     try:
         requests.post(
