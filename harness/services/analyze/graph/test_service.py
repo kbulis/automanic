@@ -125,6 +125,129 @@ def test_reexports_and_dynamic_imports(tmp_path):
     assert {dst for src, dst in imports if src in ("legacy.js", "pkg/loader.py")} == {"lazy.ts", "pkg/plugin.py"}
 
 
+def test_commonjs_exports_and_requires_resolve(tmp_path):
+    db = build(tmp_path, {
+        "store.js": """
+            class Store { add() {} }
+            module.exports = Store;
+        """,
+        "api.js": """
+            function load() {}
+            function _hidden() {}
+            module.exports = { load, save() {}, };
+        """,
+        "util.js": """
+            exports.slug = function () {};
+            module.exports.trim = (s) => s;
+            function pad() {}
+            exports.pad = pad;
+            function inner() {}
+        """,
+        "factory.js": "module.exports = function () {};\n",
+        ".eslintrc.js": "module.exports = { root: true, env: { node: true } };\n",
+        "index.js": "module.exports = require('./util');\n",
+        "app.js": """
+            const Store = require("./store");
+            const api = require("./api");
+            const { slug, trim: clean } = require("./util");
+            const pad = require("./util").pad;
+            const { save } = require("./api");
+            const make = require("./factory");
+            const lib = require(".");
+            function main() {
+              const s = new Store();
+              api.load(); api.save(); save();
+              slug(); clean(); pad(); make();
+              lib.trim();
+            }
+        """,
+    })
+    assert edges_from(db, "app.js::main", "CALLS") == {
+        ("store.js::Store", "exact"),
+        ("api.js::load", "exact"),
+        ("api.js::api.save", "exact"),
+        ("util.js::slug", "exact"),
+        ("util.js::trim", "exact"),
+        ("util.js::pad", "exact"),
+        ("factory.js::factory", "exact"),
+    }
+    # What a file assigns `module.exports`, or as one of its names, is exported.
+    exported = {i for (i,) in db.execute("SELECT id FROM symbols WHERE exported")}
+    assert {"store.js::Store", "api.js::load", "api.js::api", "api.js::api.save", "util.js::slug", "util.js::trim",
+            "util.js::pad", "factory.js::factory"} <= exported
+    assert not {"api.js::_hidden", "util.js::inner"} & exported
+    # Hidden files' exports are named without their dot, which would read as qualifying them.
+    assert {".eslintrc.js::eslintrc", ".eslintrc.js::eslintrc.env"} <= exported
+
+
+def test_ts_workspace_packages_resolve(tmp_path):
+    db = build(tmp_path, {
+        "package.json": '{"name": "acme", "workspaces": ["packages/*", "apps/*"]}',
+        "packages/ui/package.json": '{"name": "@acme/ui", "main": "./dist/index.js", "types": "./dist/index.d.ts"}',
+        "packages/ui/src/index.ts": "export function render() {}\n",
+        "packages/ui/src/button.ts": "export function Button() {}\n",
+        "packages/core/package.json": """
+            {"name": "@acme/core", "exports": {
+                ".": {"types": "./lib/main.d.ts", "import": "./lib/main.js"},
+                "./features/*": "./src/features/*.ts"
+            }}
+        """,
+        "packages/core/src/main.ts": "export function start() {}\n",
+        "packages/core/src/features/auth.ts": "export function login() {}\n",
+        "apps/web/package.json": '{"name": "web", "dependencies": {"@acme/ui": "workspace:*", "react": "18"}}',
+        "apps/web/src/app.ts": """
+            import { render } from "@acme/ui";
+            import { Button } from "@acme/ui/button";
+            import { start } from "@acme/core";
+            import { login } from "@acme/core/features/auth";
+            import React from "react";
+            export function main() {
+              render(); Button(); start(); login();
+            }
+        """,
+    })
+    assert {dst for src, dst in edges(db, "IMPORTS") if src == "apps/web/src/app.ts"} == {
+        "packages/ui/src/index.ts", "packages/ui/src/button.ts", "packages/core/src/main.ts", "packages/core/src/features/auth.ts",
+    }
+    assert edges_from(db, "apps/web/src/app.ts::main", "CALLS") == {
+        ("packages/ui/src/index.ts::render", "exact"),
+        ("packages/ui/src/button.ts::Button", "exact"),
+        ("packages/core/src/main.ts::start", "exact"),
+        ("packages/core/src/features/auth.ts::login", "exact"),
+    }
+
+
+def test_python_project_roots_resolve(tmp_path):
+    db = build(tmp_path, {
+        "services/api/app/__init__.py": "",
+        "services/api/app/models.py": "class User: ...\n",
+        "services/api/app/subprocess.py": "",
+        "services/api/app/main.py": """
+            import subprocess
+            from app.models import User
+            def handler(): User()
+        """,
+        "services/api/tests/test_models.py": """
+            from app import models
+            def test_user(): models.User()
+        """,
+        "libs/text/pyproject.toml": "[project]\nname = 'text'\n",
+        "libs/text/src/text/__init__.py": "",
+        "libs/text/src/text/clean.py": "def strip(s): ...\n",
+        "libs/text/tests/test_clean.py": """
+            from text.clean import strip
+            def test_strip(): strip("x")
+        """,
+    })
+    assert edges_from(db, "services/api/app/main.py::handler", "CALLS") == {("services/api/app/models.py::User", "exact")}
+    # A package's own directory isn't searched: `import subprocess` in it is python's.
+    assert {dst for src, dst in edges(db, "IMPORTS") if src == "services/api/app/main.py"} == {"services/api/app/models.py"}
+    assert edges_from(db, "services/api/tests/test_models.py::test_user", "CALLS") == {
+        ("services/api/app/models.py::User", "exact"),
+    }
+    assert edges_from(db, "libs/text/tests/test_clean.py::test_strip", "CALLS") == {("libs/text/src/text/clean.py::strip", "exact")}
+
+
 # 3. Signatures and docs.
 
 def test_python_signatures_and_docs(tmp_path):
@@ -456,6 +579,46 @@ def test_typescript_path_aliases_from_nearest_config(tmp_path):
     assert edges_from(db, "api/routes/users.js::list", "CALLS") == {("api/lib/db.js::query", "exact")}
 
 
+# Builds.
+
+def test_resolving_out_of_time_keeps_parsing_and_last_edges(tmp_path, monkeypatch):
+    db = build(tmp_path, {
+        "lib.py": "def helper(): ...\n",
+        "app.py": "from lib import helper\ndef main(): helper()\n",
+    })
+    root, storage = tmp_path / "src", str(tmp_path / "graph.sqlite")
+    (root / "app.py").write_text("from lib import helper\ndef main(): helper()\ndef added(): helper()\n")
+
+    # Past the deadline, resolving stops, leaving its changes to roll back.
+    connection = sqlite3.connect(storage)
+    try:
+        service.GraphClient._resolve(connection, service.GraphClient._languages, root, 0)
+        raise AssertionError("expected TimeoutError")
+    except TimeoutError:
+        connection.rollback()
+    connection.close()
+
+    def out_of_time(*args):
+        raise TimeoutError("resolving edges timed out")
+
+    monkeypatch.setattr(service.GraphClient, "_resolve", out_of_time)
+    result = service.client.build_database(str(root), storage, 30)
+    assert (result["status"], result["parsed"], "note" in result) == ("partial", 1, False)
+    db = sqlite3.connect(storage)
+    assert "app.py::added" in symbols(db)
+    assert edges(db, "CALLS") == {("app.py::main", "lib.py::helper")}
+    assert service.graph_state(storage)["status"] == "partial"
+
+    # With nothing left to parse, more time is what it needs.
+    result = service.client.build_database(str(root), storage, 30)
+    assert (result["status"], result["parsed"], "note" in result) == ("partial", 0, True)
+
+    monkeypatch.undo()
+    result = service.client.build_database(str(root), storage, 30)
+    assert result["status"] == "complete" and "note" not in result
+    assert edges(sqlite3.connect(storage), "CALLS") == {("app.py::main", "lib.py::helper"), ("app.py::added", "lib.py::helper")}
+
+
 # Search.
 
 def search(tmp_path: pathlib.Path, kind: str, query: str = "") -> list[dict]:
@@ -636,7 +799,7 @@ def test_get_context_relates_symbols(tmp_path):
 
     assert store["counts"] == {
         "members": 2, "callers": 1, "callees": 0, "bases": 1, "subclasses": 1, "uses": 0, "used_by": 0,
-        "references": 0, "referenced_by": 0,
+        "references": 0, "referenced_by": 0, "overrides": 0, "overridden_by": 0,
     }
     assert service.get_context(storage, "store.py::Item", include_source=True)["source"] == "class Item: ..."
 
@@ -785,6 +948,40 @@ def test_get_source_reads_lines(tmp_path):
         assert service.get_source(str(root), *args)["status"] == "failed", args
 
 
+def test_symbols_at_lines(tmp_path):
+    build(tmp_path, {
+        "store.py": """
+            import os
+            class Store:
+                def add(self, item):
+                    return item
+
+                def drop(self, item):
+                    pass
+            LIMIT = 3
+        """,
+    })
+    storage = str(tmp_path / "graph.sqlite")
+
+    def at(*lines, **options):
+        result = service.get_symbols_at(storage, "store.py", *lines, **options)
+        assert result["status"] == "complete" and not result["stale"], result
+        return [r["id"] for r in result["results"]]
+
+    # A line's innermost symbol first, out to the file.
+    assert at(4) == ["store.py::Store.add", "store.py::Store", "store.py"]
+    # Lines between symbols and outside any are in their owners only.
+    assert at(5) == ["store.py::Store", "store.py"]
+    assert at(1) == ["store.py"]
+    # A range spans every symbol it touches.
+    assert at(4, 8) == ["store.py::LIMIT", "store.py::Store.add", "store.py::Store.drop", "store.py::Store", "store.py"]
+    assert at(3, 6, limit=1) == ["store.py::Store.add"]
+
+    missing = service.get_symbols_at(storage, "stor.py", 1)
+    assert missing["status"] == "failed"
+    assert service.get_symbols_at(storage, "./store.py", 8)["results"][0]["id"] == "store.py::LIMIT"
+
+
 # Receiver inference.
 
 def test_python_infers_receivers(tmp_path):
@@ -825,6 +1022,7 @@ def test_python_infers_receivers(tmp_path):
     })
     assert edges_from(db, "models.py::Cache.fill", "CALLS") == {
         ("models.py::Cache.flush", "inferred"),   # self
+        ("models.py::Fast.flush", "inferred"),    # self may be a Fast, which overrides it
         ("models.py::Store.add", "inferred"),     # class attribute, parameter, `X | None`, local
         ("models.py::Base.save", "inferred"),     # attribute from __init__, method of a base
         ("models.py::Store", "exact"),            # constructed
@@ -1067,6 +1265,192 @@ def test_walks_rank_confidence(tmp_path):
     ]
     kept = service.get_related(str(tmp_path / "graph.sqlite"), "lib.py::Store.save", "callers", depth=4, skip_guesses=True)
     assert [r["id"] for r in kept["results"]] == ["lib.py::Store.add", "lib.py::use", "lib.py::Other.use_it"]
+
+
+# Overrides.
+
+def test_python_overrides_and_dispatch(tmp_path):
+    db = build(tmp_path, {
+        "shapes.py": """
+            class Shape:
+                def area(self): ...
+                def describe(self):
+                    return self.area()
+            class Square(Shape):
+                def area(self): ...
+            class Cube(Square):
+                def area(self):
+                    return super().area()
+            class Circle(Shape):
+                def area(self): ...
+        """,
+        "app.py": """
+            from shapes import Shape, Square
+            def total(shape: Shape, square: Square):
+                shape.area()
+                square.area()
+        """,
+    })
+    overrides = edges(db, "OVERRIDES")
+    assert overrides == {
+        ("shapes.py::Square.area", "shapes.py::Shape.area"),
+        ("shapes.py::Cube.area", "shapes.py::Square.area"),
+        ("shapes.py::Circle.area", "shapes.py::Shape.area"),
+    }
+    # A call through a type may run its subtypes' overrides, but not its siblings'.
+    assert edges_from(db, "app.py::total", "CALLS") == {
+        ("shapes.py::Shape.area", "inferred"),
+        ("shapes.py::Square.area", "inferred"),
+        ("shapes.py::Cube.area", "inferred"),
+        ("shapes.py::Circle.area", "inferred"),
+    }
+    assert edges_from(db, "shapes.py::Shape.describe", "CALLS") == {
+        ("shapes.py::Shape.area", "inferred"),
+        ("shapes.py::Square.area", "inferred"),
+        ("shapes.py::Cube.area", "inferred"),
+        ("shapes.py::Circle.area", "inferred"),
+    }
+    # `super()` runs its own.
+    assert edges_from(db, "shapes.py::Cube.area", "CALLS") == {("shapes.py::Square.area", "inferred")}
+
+    storage = str(tmp_path / "graph.sqlite")
+    area = service.get_context(storage, "shapes.py::Square.area")
+    assert [(o["id"], o["confidence"]) for o in area["overrides"]] == [("shapes.py::Shape.area", "exact")]
+    assert [o["id"] for o in area["overridden_by"]] == ["shapes.py::Cube.area"]
+    assert [c["id"] for c in area["callers"]] == ["app.py::total", "shapes.py::Cube.area", "shapes.py::Shape.describe"]
+    walked = service.get_related(storage, "shapes.py::Shape.area", "overridden_by", depth=2)
+    assert [(r["id"], r["depth"]) for r in walked["results"]] == [
+        ("shapes.py::Circle.area", 1), ("shapes.py::Square.area", 1), ("shapes.py::Cube.area", 2),
+    ]
+
+
+def test_ts_implements_interfaces(tmp_path):
+    db = build(tmp_path, {
+        "store.ts": """
+            export interface Saver {
+              save(item: string): void;
+              name: string;
+            }
+            export abstract class Base implements Saver {
+              name = "base";
+              abstract save(item: string): void;
+            }
+            export class Disk extends Base {
+              save(item: string) {}
+            }
+            export function persist(saver: Saver) {
+              saver.save("x");
+            }
+            export function blind(thing) {
+              thing.save("x");
+            }
+            export function bare() {
+              save("x");
+            }
+            export function shadowed() {
+              const persist = (x: string) => x;
+              persist("x");
+            }
+        """,
+    })
+    found = symbols(db)
+    assert found["store.ts::Saver.save"][:2] == ("method", "save(item: string): void")
+    assert found["store.ts::Base.save"][0] == "method"
+    assert "store.ts::Saver.name" not in found
+    assert edges(db, "OVERRIDES") == {
+        ("store.ts::Base.save", "store.ts::Saver.save"),
+        ("store.ts::Disk.save", "store.ts::Base.save"),
+    }
+    assert edges_from(db, "store.ts::persist", "CALLS") == {
+        ("store.ts::Saver.save", "inferred"),
+        ("store.ts::Base.save", "inferred"),
+        ("store.ts::Disk.save", "inferred"),
+    }
+    # Guesses by name skip interface methods, which only declare.
+    assert ("store.ts::Saver.save", "guess") not in edges_from(db, "store.ts::blind", "CALLS")
+    # Nor methods for bare names, as methods are only called on something.
+    assert edges_from(db, "store.ts::bare", "CALLS") == set()
+    # Nor the file's functions for bare calls of local ones.
+    assert edges_from(db, "store.ts::shadowed", "CALLS") == set()
+    exported = dict(db.execute("SELECT id, exported FROM symbols WHERE id = 'store.ts::Saver.save'"))
+    assert exported == {"store.ts::Saver.save": 1}
+
+
+def test_go_types_implement_interfaces(tmp_path):
+    db = build(tmp_path, {
+        "go.mod": "module example.com/app\n",
+        "store/store.go": """
+            package store
+
+            // Saver saves items.
+            type Saver interface {
+            	// Save saves one.
+            	Save(item string) error
+            	Close() error
+            }
+
+            type Disk struct{}
+
+            func (d *Disk) Close() error { return nil }
+        """,
+        "store/disk.go": """
+            package store
+
+            func (d *Disk) Save(item string) error { return nil }
+
+            type Partial struct{}
+
+            func (p Partial) Save(item string) error { return nil }
+
+            func Persist(s Saver) error {
+            	return s.Save("x")
+            }
+        """,
+    })
+    found = symbols(db)
+    assert found["store/store.go::Saver.Save"] == ("method", "Save(item string) error", "Save saves one.")
+    # Implementing is having all of an interface's methods, wherever in the package they're declared.
+    assert set(db.execute("SELECT src_id, dst_id, confidence FROM edges WHERE kind = 'INHERITS'")) == {
+        ("store/store.go::Disk", "store/store.go::Saver", "inferred"),
+    }
+    assert edges(db, "OVERRIDES") == {
+        ("store/disk.go::Disk.Save", "store/store.go::Saver.Save"),
+        ("store/store.go::Disk.Close", "store/store.go::Saver.Close"),
+    }
+    assert edges_from(db, "store/disk.go::Persist", "CALLS") == {
+        ("store/store.go::Saver.Save", "inferred"),
+        ("store/disk.go::Disk.Save", "inferred"),
+    }
+
+
+def test_local_names_shadow_bare_calls(tmp_path):
+    db = build(tmp_path, {
+        "copy.py": """
+            def deepcopy(x): ...
+            def log(x): ...
+            def rule(x): ...
+            def walk(items, deepcopy=deepcopy):
+                for rule in items:
+                    rule(1)
+                deepcopy(items)
+            def init():
+                global log
+                log = print
+                log(1)
+            def local(log):
+                log(1)
+            def nested(onexc=None):
+                if onexc is None:
+                    def onexc(x): ...
+                onexc(1)
+        """,
+    })
+    # Aliases of the file's names and `global` names are the file's; parameters and loop variables aren't.
+    assert edges_from(db, "copy.py::walk", "CALLS") == {("copy.py::deepcopy", "exact")}
+    assert edges_from(db, "copy.py::init", "CALLS") == {("copy.py::log", "exact")}
+    assert edges_from(db, "copy.py::local", "CALLS") == set()
+    # A function defined in one is its symbol, though a parameter has its name too.
+    assert edges_from(db, "copy.py::nested", "CALLS") == {("copy.py::nested.onexc", "exact")}
 
 
 # Values and components.

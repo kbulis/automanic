@@ -9,7 +9,8 @@ MCP service for autonomous agents to efficiently organize and analyze code bases
 - Build or update the graph of a source tree; only changed files are parsed again
 - Find where to start in an unfamiliar code base, including each project of a monorepo
 - Outline files and look up symbols by name, without reading whole files
-- See what a symbol calls, renders, inherits, references, and is used by
+- See what a symbol calls, renders, inherits, overrides, references, and is used by
+- Find the symbols at a file's lines, e.g. from a stack trace or a diff hunk
 - Follow those relationships to find what a change can break and which tests reach it
 - Read source lines of a symbol or file
 

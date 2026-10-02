@@ -26,7 +26,7 @@ class LogExceptionHandler(logging.StreamHandler):
 
 logging.basicConfig(
     handlers=[LogExceptionHandler(stream=sys.stdout, fmt="%(asctime)s %(levelname)s: %(message)s")],
-    level=os.environ.get("LOG_LEVEL", logging.INFO),
+    level=os.environ.get("LOG_LEVEL", "INFO").upper(),
     force=True,
 )
 
@@ -321,10 +321,6 @@ def ping() -> str:
     return "ok" if client.is_ready() else "down"
 
 def add_to_registry(name: str, role: str, endpoint: str, url: str, port: int):
-    if not endpoint or not url:
-        log.warning("~ endpoint or url not configured")
-        return
-
     deadline = time.monotonic() + 30
 
     while time.monotonic() < deadline:
@@ -363,9 +359,18 @@ if __name__ == "__main__":
     . powered by automanic 🍣
     . """))
 
-    log.info(f". filtering on discord channel {channel_id} [{secret_key[0:3]}...]")
+    if not registry_url:
+        log.error("! registry url not configured, exiting")
+        sys.exit(1)
+
+    if not endpoint_url:
+        log.error("! endpoint url not configured, exiting")
+        sys.exit(1)
+
+    log.info(f". filtering on discord channel {channel_id} [{secret_key[0:3]}...] as {service_name}")
     log.info(f". posting as '{robot_name}'")
-    log.info(f". available tools:")
+
+    log.info(". available tools:")
     for tool in mcp._tool_manager.list_tools():
         log.info(f". {tool.name}")
     gateway = threading.Thread(

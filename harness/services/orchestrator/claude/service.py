@@ -31,7 +31,7 @@ class LogExceptionHandler(logging.StreamHandler):
 
 logging.basicConfig(
     handlers=[LogExceptionHandler(stream=sys.stdout, fmt="%(asctime)s %(levelname)s: %(message)s")],
-    level=os.environ.get("LOG_LEVEL", logging.INFO),
+    level=os.environ.get("LOG_LEVEL", "INFO").upper(),
     force=True,
 )
 

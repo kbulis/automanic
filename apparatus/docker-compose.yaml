@@ -15,6 +15,8 @@ services:
     depends_on:
       - orchestrator
     environment:
+      SERVICE_NAME: feedback-discord
+      SERVICE_ROLE: feedback
       SECRET_KEY: ${DISCORD_BOT_KEY:?DISCORD_BOT_KEY is required}
       CHANNEL_ID: ${DISCORD_CHANNEL:?DISCORD_CHANNEL is required}
       ROBOT_NAME: ${POSTING_AS_NAME:?POSTING_AS_NAME is required}
@@ -30,6 +32,8 @@ services:
     depends_on:
       - orchestrator
     environment:
+      SERVICE_NAME: shell-bash
+      SERVICE_ROLE: shell
       ENDPOINT_URL: http://shell:8000/mcp
       REGISTRY_URL: http://orchestrator:8000/registry
     ports:

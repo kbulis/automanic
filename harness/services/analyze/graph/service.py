@@ -35,7 +35,7 @@ class LogExceptionHandler(logging.StreamHandler):
 
 logging.basicConfig(
     handlers=[LogExceptionHandler(stream=sys.stdout, fmt="%(asctime)s %(levelname)s: %(message)s")],
-    level=os.environ.get("LOG_LEVEL", logging.INFO),
+    level=os.environ.get("LOG_LEVEL", "INFO").upper(),
     force=True,
 )
 
@@ -205,6 +205,8 @@ class GraphClient:
                     "generator_function_declaration": "function",
                     "class_declaration": "class",
                     "method_definition": "method",
+                    "method_signature": "method",
+                    "abstract_method_signature": "method",
                     "abstract_class_declaration": "class",
                     "interface_declaration": "interface",
                     "type_alias_declaration": "type",
@@ -235,6 +237,7 @@ class GraphClient:
                     "function_expression": "function",
                     "arrow_function": "function",
                     "generator_function": "function",
+                    "object": "variable",
                 },
                 object_values=["object"],
                 receivers={},
@@ -307,6 +310,8 @@ class GraphClient:
                     "generator_function_declaration": "function",
                     "class_declaration": "class",
                     "method_definition": "method",
+                    "method_signature": "method",
+                    "abstract_method_signature": "method",
                     "abstract_class_declaration": "class",
                     "interface_declaration": "interface",
                     "type_alias_declaration": "type",
@@ -337,6 +342,7 @@ class GraphClient:
                     "function_expression": "function",
                     "arrow_function": "function",
                     "generator_function": "function",
+                    "object": "variable",
                 },
                 object_values=["object"],
                 receivers={},
@@ -430,6 +436,7 @@ class GraphClient:
                     "function_expression": "function",
                     "arrow_function": "function",
                     "generator_function": "function",
+                    "object": "variable",
                 },
                 object_values=["object"],
                 receivers={},
@@ -498,6 +505,7 @@ class GraphClient:
                 definitions={
                     "function_declaration": "function",
                     "method_declaration": "method",
+                    "method_elem": "method",
                     "type_spec": "type",
                     "type_alias": "type",
                     "const_spec": "variable",
@@ -629,7 +637,20 @@ class GraphClient:
             with self.connect(path_to_storage) as db:
                 self._set_meta(db, state="building", root=str(root), started_at=time.time())
                 parsed, unchanged, failed, complete = self._extract_all(db, root, deadline, self._languages, self._ignored_dirs)
-                self._resolve(db, self._languages, root)
+                # Parsing is kept, even if resolving runs out of time or the process dies. Edges are resolved once
+                # every file is parsed, since a partial build is called again; until then, the last build's remain.
+                db.commit()
+                note = None
+                if complete:
+                    try:
+                        self._resolve(db, self._languages, root, deadline)
+                    except TimeoutError:
+                        db.rollback()
+                        complete = False
+                        log.warning("~ resolving timed out, graph is partial")
+                        if not parsed:
+                            # Nothing was left to parse, so calling again with the same time would only time out again.
+                            note = "resolving edges takes longer than timeout_after_s; call again with a larger one"
                 state = "complete" if complete else "partial"
                 counts = {
                     "files": db.execute("SELECT COUNT(*) FROM files").fetchone()[0],
@@ -647,6 +668,7 @@ class GraphClient:
                 "elapsed_s": elapsed_s,
                 **counts,
                 "kinds_of_symbols": self._kinds_of_symbols,
+                **({"note": note} if note else {}),
             }
         finally:
             lock.release()
@@ -845,6 +867,51 @@ class GraphClient:
             "outline": outline,
         }
 
+    def locate_symbols(
+        self,
+        path_to_storage: str,
+        file_path: str,
+        start_line: int,
+        end_line: int | None,
+        limit: int,
+    ) -> dict:
+        meta = self.load_status_of(path_to_storage)
+        status = str(meta["status"])
+        if status == "missing":
+            return {"status": status}
+        file_path = file_path.strip().removeprefix("./")
+        first = max(1, start_line)
+        last = max(first, end_line or first)
+
+        with self.connect(path_to_storage, read_only=True) as db:
+            found = db.execute("SELECT sha256 FROM files WHERE path = ?", (file_path,)).fetchone()
+            if found is None:
+                return {"status": "failed", "error": f"not in the graph: {file_path}", "matches": self._matches(db, file_path)}
+            # Each symbol spanning any of the lines, innermost first; the file spans them all, so comes last.
+            rows = db.execute(
+                "SELECT id, kind, signature, start_line, end_line, exported FROM symbols "
+                "WHERE file_path = ? AND start_line <= ? AND end_line >= ? ORDER BY kind = 'file', end_line - start_line, start_line, id",
+                (file_path, last, first),
+            ).fetchall()
+
+        # A file changed or removed since the build has lines that may be out of date.
+        try:
+            source = (pathlib.Path(str(meta["root"])) / file_path).read_bytes()
+        except (KeyError, OSError):
+            source = None
+        keys = ("id", "kind", "signature", "start_line", "end_line")
+        return {
+            "status": status,
+            "file_path": file_path,
+            "start_line": first,
+            "end_line": last,
+            "test": self._test_paths.search(file_path) is not None,
+            "stale": source is None or hashlib.sha256(source).hexdigest() != found[0],
+            "results": [{**dict(zip(keys, row)), "exported": bool(row[5])} for row in rows[:max(1, limit)]],
+            "count": len(rows),
+            "truncated": len(rows) > max(1, limit),
+        }
+
     def describe_symbol(
         self,
         path_to_storage: str,
@@ -887,6 +954,8 @@ class GraphClient:
                 "used_by": ("USES", "dst_id", "src_id"),
                 "references": ("REFERENCES", "src_id", "dst_id"),
                 "referenced_by": ("REFERENCES", "dst_id", "src_id"),
+                "overrides": ("OVERRIDES", "src_id", "dst_id"),
+                "overridden_by": ("OVERRIDES", "dst_id", "src_id"),
             }.items():
                 grouped: dict[str, dict] = {}
                 for other_id, other_kind, other_signature, confidence, line in db.execute(
@@ -1270,6 +1339,9 @@ class GraphClient:
         # value nodes already collected, as holders nest: `f(a == b)`.
         frame_parents: dict[int, int | None] = {tree.root_node.id: None}
         local_names: set[tuple[int, str]] = set()
+        # Names in a frame that aren't its locals though bound in it: python's `global log` and `nonlocal
+        # count`, of the file or a function around, and functions and classes defined in it, which are symbols.
+        not_locals: set[tuple[int, str]] = set()
         valued: set[int] = set()
         # Whether each symbol is visible outside its file on its own, before its owner's, and the names a file
         # exports by listing them: python's `__all__`, ts's `export { a }` and `export default a`.
@@ -1298,6 +1370,17 @@ class GraphClient:
                 scope_id = parents.get(scope_id)
             return expression
 
+        def aliases(name: str, value: tree_sitter.Node | None) -> bool:
+            # A local bound to what has its name means the same, so isn't another: python's `deepcopy=deepcopy`
+            # default, `_wrap = _bootstrap._wrap`.
+            text = (value.text or b"").decode("utf-8", errors="replace") if value is not None else ""
+            return text.rpartition(".")[2] == name
+
+        # What an unnamed default export is named after: its file, or its directory for index files: `Button.tsx` -> Button,
+        # without the dots of hidden files, which would read as qualifying it: `.eslintrc.js` -> eslintrc.
+        file = pathlib.PurePosixPath(rel_path)
+        unnamed = (file.parent.name if file.stem in spec.index_names and file.parent.name else file.stem).lstrip(".") or file.stem
+
         # The file itself is the outermost scope; module-level calls belong to it.
         root = tree.root_node
         symbols.append((rel_path, "file", rel_path, rel_path, rel_path, 1, root.end_point.row + 1, None, *cls._describe(root, spec)))
@@ -1308,11 +1391,28 @@ class GraphClient:
             node, scope, scope_kind, prefix, frame = stack.pop()
             line = node.start_point.row + 1
 
+            # An unnamed `export default class {}` or `export default () => ...` defines one too, named after its file,
+            # as does assigning commonjs's `module.exports = ...` at file level; `exports.load = function () {}` and
+            # `module.exports.load = ...` define one by its name.
+            exported_name = None
+            around = node.parent
+            if node.type in spec.default_exports and around is not None:
+                if around.type == "export_statement" and around.child_by_field_name("value") == node:
+                    exported_name = unnamed
+                elif around.type == "assignment_expression" and around.child_by_field_name("right") == node and scope_kind == "file":
+                    left = around.child_by_field_name("left")
+                    assigned = (left.text or b"").decode("utf-8", errors="replace").removeprefix("module.") if left is not None else ""
+                    if assigned == "exports":
+                        exported_name = unnamed
+                    elif assigned.startswith("exports.") and assigned.removeprefix("exports.").replace("$", "_").isidentifier():
+                        exported_name = assigned.removeprefix("exports.")
+            default_kind = spec.default_exports.get(node.type) if exported_name is not None else None
+
             # An unnamed function, e.g. a callback, is a body of its own whose names are its locals, though
             # what it calls belongs to the symbol around it: `describe(() => { const store = ... })`.
             if node.type in spec.function_values and (node.parent is None or node.parent.type not in spec.definitions) and not (
                 node.parent is not None and node.parent.type == "export_statement"
-            ):
+            ) and default_kind is None:
                 frame_parents[node.id], frame, scope_kind = frame, node.id, "function"
 
             # Types declarations give names: `s: Store`, `s = Store()`, `self.store = Store()`, go's
@@ -1333,7 +1433,7 @@ class GraphClient:
                     constructed = cls._type_name(value) if value is not None and value.type in spec.constructors else None
                     type_name = declared or (typed(scope, constructed) if constructed is not None else None)
                     holder, _, name = (name_node.text or b"").decode("utf-8", errors="replace").rpartition(".")
-                    if not holder and scope_kind not in ("file", "class", "variable"):
+                    if not holder and scope_kind not in ("file", "class", "variable") and not aliases(name, value):
                         local_names.add((frame, name))
                     if type_name is None or not name.replace("$", "_").isidentifier():
                         continue
@@ -1361,13 +1461,20 @@ class GraphClient:
                     if bound_node is None:
                         continue
                     if bound_node.type in ("identifier", "shorthand_property_identifier_pattern") and bound_node.text:
-                        local_names.add((frame, bound_node.text.decode("utf-8", errors="replace")))
+                        name = bound_node.text.decode("utf-8", errors="replace")
+                        holder = bound_node.parent
+                        default = holder.child_by_field_name("value") or holder.child_by_field_name("right") if holder else None
+                        if default is None or default == bound_node or not aliases(name, default):
+                            local_names.add((frame, name))
                         continue
                     # Not defaults or annotations: `(a = DEFAULT)`, `(a: Store)`.
                     pending.extend(
                         c for i, c in enumerate(bound_node.children)
                         if c.is_named and bound_node.field_name_for_child(i) not in ("value", "type", "right", "default", "body")
                     )
+
+            if node.type in ("global_statement", "nonlocal_statement"):
+                not_locals.update((frame, c.text.decode("utf-8", errors="replace")) for c in node.named_children if c.text)
 
             # Names used as values: `map(format)`, `onClick={save}`, `except StoreError`, `== Role.ADMIN`,
             # looking through expressions that only combine them: `(A, B)`, `a if c else b`.
@@ -1400,14 +1507,24 @@ class GraphClient:
                 if tag is not None and tag.text and (tag.type != "identifier" or tag.text[:1].isupper()):
                     named.append(("CALLS", scope, tag, line, frame))
 
-            # An unnamed `export default class {}` or `export default () => ...` defines one too.
-            default_kind = (
-                spec.default_exports.get(node.type)
-                if node.parent is not None
-                and node.parent.type == "export_statement"
-                and node.parent.child_by_field_name("value") == node
-                else None
-            )
+            # Commonjs's `module.exports = ...` is what importing the file's default gives, and exports the names it
+            # gives: `module.exports = Store`, `module.exports = { load, save }`, `exports.load = load`.
+            if node.type == "assignment_expression" and spec.visibility == "export" and scope_kind == "file":
+                left, right = node.child_by_field_name("left"), node.child_by_field_name("right")
+                assigned = (left.text or b"").decode("utf-8", errors="replace").removeprefix("module.") if left is not None else ""
+                value = (right.text or b"").decode("utf-8", errors="replace") if right is not None else ""
+                if assigned == "exports" and right is not None and right.type in spec.default_exports:
+                    refs.append((rel_path, "DEFAULT", unnamed, rel_path, line, None, None))
+                    if right.type in spec.object_values:
+                        export_listed.update(
+                            c.text.decode("utf-8", errors="replace") for c in right.named_children
+                            if c.type == "shorthand_property_identifier" and c.text
+                        )
+                elif assigned == "exports" and right is not None and right.type == "identifier":
+                    refs.append((rel_path, "DEFAULT", value, rel_path, line, None, None))
+                    export_listed.add(value)
+                elif assigned == f"exports.{value}" and right is not None and right.type == "identifier":
+                    export_listed.add(value)
 
             if node.type in spec.definitions or default_kind is not None:
                 kind = default_kind or spec.definitions[node.type]
@@ -1422,10 +1539,22 @@ class GraphClient:
                 namespace = False
                 if kind == "variable":
                     # Plain names at file or class level, or in an object namespace; skips locals,
-                    # `a, b = ...`, `self.x = ...`, `{ a } = o`. Object values name their members, e.g. `api.get`.
+                    # `a, b = ...`, `self.x = ...`, `{ a } = o`. Object values name their members, e.g. `api.get`,
+                    # as do objects exported themselves, e.g. `module.exports = { get() {} }`.
                     function_valued = any(c.type in spec.function_values for c in node.named_children)
-                    namespace = any(c.type in spec.object_values for c in node.named_children)
+                    namespace = node.type in spec.object_values or any(c.type in spec.object_values for c in node.named_children)
+                    # Names bound to what a module loads are imports, not definitions: `const Store = require("./store")`.
+                    value = node.child_by_field_name("value") or node.child_by_field_name("right")
+                    while value is not None and value.type in ("member_expression", "attribute"):
+                        value = value.child_by_field_name("object")
+                    callee = value.child_by_field_name(spec.calls[value.type]) if value is not None and value.type in spec.calls else None
                     if (
+                        callee is not None
+                        and callee.text is not None
+                        and callee.text.decode("utf-8", errors="replace").rsplit(".", 1)[-1] in spec.import_calls
+                    ):
+                        name_node = None
+                    elif (
                         scope_kind not in ("file", "class", "variable")
                         or (scope_kind == "variable" and not (function_valued or namespace))
                         or (node.type == "pair" and scope_kind != "variable")
@@ -1437,13 +1566,11 @@ class GraphClient:
                         name_node = None
                     elif function_valued:
                         kind = "function"
-                elif kind == "method" and scope_kind not in ("class", "variable") and node.type not in spec.receivers:
+                elif kind == "method" and scope_kind not in ("class", "interface", "variable") and node.type not in spec.receivers:
                     # Object methods outside a namespace, e.g. callbacks in `app.use({ handler() {} })`.
                     name_node = None
                 if default_kind is not None:
-                    # Named after its file, or its directory for index files: `Button.tsx` -> Button.
-                    path = pathlib.PurePosixPath(rel_path)
-                    name = path.parent.name if path.stem in spec.index_names and path.parent.name else path.stem
+                    name = exported_name
                 elif name_node is not None and name_node.text is not None:
                     name = name_node.text.decode("utf-8", errors="replace")
                 else:
@@ -1468,6 +1595,8 @@ class GraphClient:
                         *cls._describe(node, spec),
                     ))
                     parents[symbol_id], kinds[symbol_id], qualifieds[symbol_id] = scope, kind, qualified
+                    if kind != "variable":
+                        not_locals.add((frame, name))
                     if namespace:
                         namespaces.add(symbol_id)
                     # Visible on its own: python's names without a leading underscore, or dunders; go's capitalized
@@ -1559,15 +1688,33 @@ class GraphClient:
                     target = cls._import_target(first)
                     if target is not None:
                         refs.append((rel_path, "IMPORTS", target, rel_path, line, None, None))
-                        # `const x = require("./x")` and `x = importlib.import_module("x")` bind the module to x.
-                        holder = node.parent
+                        # `const x = require("./x")` and `x = importlib.import_module("x")` bind the module to x;
+                        # `const { a, b: c } = require("./x")` and `const a = require("./x").a` bind names in it, and
+                        # `module.exports = require("./x")` exports all of them.
+                        holder, member = node.parent, None
+                        if holder is not None and holder.type == "member_expression" and holder.child_by_field_name("object") == node:
+                            member, holder = holder.child_by_field_name("property"), holder.parent
                         local = (
                             holder.child_by_field_name("name") or holder.child_by_field_name("left")
-                            if holder is not None and holder.type in ("variable_declarator", "assignment")
+                            if holder is not None and holder.type in ("variable_declarator", "assignment", "assignment_expression")
                             else None
                         )
-                        if local is not None and local.type == "identifier" and local.text:
-                            bindings.append((rel_path, local.text.decode("utf-8", errors="replace"), target, None, line))
+                        text = (local.text or b"").decode("utf-8", errors="replace") if local is not None else ""
+                        if local is not None and local.type == "identifier" and text:
+                            name = member.text.decode("utf-8", errors="replace") if member is not None and member.text else None
+                            bindings.append((rel_path, text, target, name, line))
+                        elif local is not None and local.type == "object_pattern" and member is None:
+                            for part in local.named_children:
+                                key, value = (part, part) if part.type == "shorthand_property_identifier_pattern" else (
+                                    part.child_by_field_name("key"), part.child_by_field_name("value")
+                                )
+                                if key is not None and value is not None and value.type in ("identifier", "shorthand_property_identifier_pattern") and key.text and value.text:
+                                    bindings.append((
+                                        rel_path, value.text.decode("utf-8", errors="replace"), target,
+                                        key.text.decode("utf-8", errors="replace"), line,
+                                    ))
+                        elif text.removeprefix("module.") == "exports" and member is None and scope_kind == "file":
+                            bindings.append((rel_path, "*", target, None, line))
 
             elif node.type in spec.type_annotations:
                 # Every type named in it: `list[m.Item]` -> list, Item; `Promise<Store<T>>` -> Promise, Store, T.
@@ -1611,14 +1758,14 @@ class GraphClient:
                     default = declaration.child_by_field_name("name") if declaration is not None else value
                     if default is not None and default.type in spec.default_exports:
                         # Unnamed, so named after its file like the symbol it defines.
-                        path = pathlib.PurePosixPath(rel_path)
-                        name = path.parent.name if path.stem in spec.index_names and path.parent.name else path.stem
-                        refs.append((rel_path, "DEFAULT", name, rel_path, line, None, None))
+                        refs.append((rel_path, "DEFAULT", unnamed, rel_path, line, None, None))
                     elif default is not None and default.type in ("identifier", "type_identifier") and default.text:
                         refs.append((rel_path, "DEFAULT", default.text.decode("utf-8", errors="replace"), rel_path, line, None, None))
                         export_listed.add(default.text.decode("utf-8", errors="replace"))
 
             stack.extend((child, scope, scope_kind, prefix, frame) for child in reversed(node.named_children))
+
+        local_names -= not_locals
 
         # Last name in each expression: `a.b.c()` -> "c", `new Foo()` -> "Foo", `Generic[T]` -> "Generic".
         # What it is reached through is its qualifier, when a plain dotted name: `a.b.c()` -> "a.b".
@@ -1669,8 +1816,9 @@ class GraphClient:
             if expression is None or not expression.text:
                 continue
             target = expression.text.decode("utf-8", errors="replace")
-            # A value named by a local name, `f(data)` in a function with its own `data`, isn't the file's.
-            if kind == "REFERENCES" and receiver is None:
+            # A value or bare call named by a local name, `f(data)` or `num(v)` in a function with its own
+            # `data` or `const num = ...`, isn't the file's.
+            if (kind == "REFERENCES" or (kind == "CALLS" and qualifier is None)) and receiver is None:
                 head, around, local = qualifier.split(".")[0] if qualifier else target, frame, False
                 while around is not None and not local:
                     local, around = (around, head) in local_names, frame_parents.get(around)
@@ -1772,6 +1920,9 @@ class GraphClient:
                 db.executemany("INSERT INTO refs VALUES (?, ?, ?, ?, ?, ?, ?)", refs)
                 db.executemany("INSERT INTO bindings VALUES (?, ?, ?, ?, ?)", bindings)
                 parsed += 1
+                if parsed % 256 == 0:
+                    # Kept as it goes, so a build that dies has parsed what it did when called again.
+                    db.commit()
 
         # Files gone from disk; their symbols and refs go with them.
         db.executemany("DELETE FROM files WHERE path = ?", [(rel_path,) for rel_path in known.keys() - seen])
@@ -1783,12 +1934,20 @@ class GraphClient:
         db: sqlite3.Connection,
         languages: list[tuple[list[str], LanguageSpec]],
         root: pathlib.Path,
+        deadline: float,
     ):
         """
-        Rebuild edges from symbols and raw refs. Calls, bases, and types resolve
+        Rebuild edges from symbols and raw refs, or raise TimeoutError past the deadline. Calls, bases, and types resolve
         exactly through definitions and import bindings when they can, else by
         name, preferring the same file, then imported files, then a unique match.
+        Methods override their bases' namesakes, and calls through a type also
+        call the overrides in its subtypes.
         """
+
+        def on_time(count: int):
+            # Checked every so often in long loops; a build that runs out of time keeps the last edges.
+            if count % 1024 == 0 and time.monotonic() > deadline:
+                raise TimeoutError("resolving edges timed out")
 
         files = {path for (path,) in db.execute("SELECT path FROM files")}
         by_name: dict[str, list[tuple[str, str, str]]] = {}
@@ -1832,13 +1991,28 @@ class GraphClient:
                 if declaration is not None:
                     modules[declaration.split()[1].strip('"')] = directory.as_posix()
 
+        # Packages of the tree by their package.json name, from the directories of js and ts files and those around them.
+        manifests: dict[str, tuple[pathlib.PurePosixPath, dict]] = {}
+        for directory in sorted({
+            d for path, spec in specs.items() if spec.separator == "/" and not spec.packages for d in pathlib.PurePosixPath(path).parents
+        }):
+            manifest = root / directory / "package.json"
+            try:
+                package = json.loads(manifest.read_text(errors="replace")) if manifest.is_file() else None
+            except (OSError, ValueError) as ex:
+                log.warning(f"~ skipping {manifest}: {ex}")
+                continue
+            if isinstance(package, dict) and isinstance(package.get("name"), str):
+                manifests.setdefault(package["name"], (directory, package))
+
         configs: dict[pathlib.PurePosixPath, tuple[str | None, dict[str, list[str]]] | None] = {}  # directory -> its tsconfig's aliases
         imported: dict[str, set[str]] = {}
         module_files: dict[tuple[str, str], set[str]] = {}  # (importer, module as written) -> files it resolves to
         import_edges: list[tuple] = []
-        for src_id, target, file_path, line in db.execute(
+        for index, (src_id, target, file_path, line) in enumerate(db.execute(
             "SELECT src_id, target, file_path, line FROM refs WHERE kind = 'IMPORTS'"
-        ):
+        )):
+            on_time(index)
             spec = next(
                 (rule for suffixes, rule in languages if any(file_path.endswith(pattern) for pattern in suffixes)),
                 None,
@@ -1868,7 +2042,14 @@ class GraphClient:
                         base = base.parent
                     stems = [(base / module).as_posix()]
                 else:
-                    stems = [module]
+                    # Absolute: from the root of the importer's project, which in a monorepo may be any directory
+                    # around it that isn't a package, nearest first, or a src layout's: `from app.models import User`
+                    # in services/api. Not from its own package: `import subprocess` in asyncio isn't asyncio's.
+                    stems = [
+                        (directory / layout / module).as_posix()
+                        for directory in (base, *base.parents) if (directory / "__init__.py").as_posix() not in files
+                        for layout in ("", "src")
+                    ]
             elif target.startswith("."):
                 # JS/TS: "./x" and "../x" are relative.
                 stems = [(base / target).as_posix()]
@@ -1897,6 +2078,11 @@ class GraphClient:
                     ):
                         stems = [s.replace("*", target[len(prefix):len(target) - len(suffix)], 1) for s in substitutions]
                         break
+
+                # Or a package of the tree by its package.json name, as workspaces import each other: `@acme/ui/button`.
+                name = max((n for n in manifests if target == n or target.startswith(f"{n}/")), key=len, default=None)
+                if name is not None:
+                    stems += cls._package_stems(*manifests[name], f".{target[len(name):]}")
                 if base_url is not None:
                     stems.append(f"{base_url}/{target}")
 
@@ -1967,6 +2153,8 @@ class GraphClient:
                                 reached = True
                                 if rest[split:]:
                                     pending += [(g, rest[split:]) for g in module_files[(at, submodule)]]
+                                # A commonjs module is also what it assigns `module.exports`: `const Store = require("./store")`.
+                                pending += [(g, (defaults[g], *rest[split:])) for g in module_files[(at, submodule)] if g in defaults]
                                 break
                     else:
                         # A name in the module, which in python may itself be a submodule: `from . import util`.
@@ -1978,6 +2166,9 @@ class GraphClient:
                         for g in module_files.get((at, module), ()):
                             reached = True
                             pending.append((g, (defaults.get(g, name) if name == "default" else name, *rest)))
+                            # Or a member of that: `const { load } = require("./store")` with `module.exports = { load() {} }`.
+                            if name != "default" and g in defaults:
+                                pending.append((g, (defaults[g], name, *rest)))
                 if at == start and bound.get((at, head)) and not reached:
                     external = True
                 for module, _ in bound.get((at, "*"), []):
@@ -2000,6 +2191,10 @@ class GraphClient:
         }
         bases: dict[str, list[str]] = {}
         typeful = ("class", "interface", "variable")  # what a type can be; variables are object namespaces
+        declared = {  # methods of interfaces, which declare them in the same file
+            symbol_id for symbol_id, (file_path, qualified_name, kind) in where.items()
+            if kind == "method" and by_qualified.get((file_path, qualified_name.rpartition(".")[0]), ("", ""))[1] == "interface"
+        }
 
         def lineage(class_id: str) -> list[str]:
             # A class and its bases, nearest first.
@@ -2061,11 +2256,13 @@ class GraphClient:
         # Bases must be classes or interfaces, type references any kind of type; calls and values anything.
         allowed = {"INHERITS": ("class", "interface"), "USES": ("class", "interface", "type", "enum")}
         named_edges: list[tuple] = []
+        dispatched: list[tuple[str, set[str], set[str], str, int]] = []  # (caller, methods, receiver types, file, line)
         reachable: dict[str, set[str]] = {}  # file -> files its imports reach, directly or through others
-        for src_id, kind, target, file_path, line, qualifier, receiver in db.execute(
+        for index, (src_id, kind, target, file_path, line, qualifier, receiver) in enumerate(db.execute(
             "SELECT src_id, kind, target, file_path, line, qualifier, receiver FROM refs "
             "WHERE kind IN ('CALLS', 'INHERITS', 'USES', 'REFERENCES') ORDER BY kind IN ('CALLS', 'REFERENCES')"
-        ):
+        )):
+            on_time(index)
             # Called on an expression, it can't be found by name: `rows.filter(f).map(g)`.
             found, external = follow(file_path, (*(qualifier.split(".") if qualifier else ()), target)) if qualifier != "" else ([], False)
             # A bare name defined in a function around it shadows those of the file, though not through
@@ -2098,6 +2295,9 @@ class GraphClient:
                     inferred |= member(type_id, target, inherited=qualifier == "super")[0]
                 if not inferred and any(where[type_id][2] == "class" for type_id in types):
                     external = True
+                # Called on a value of these types, it may run their subtypes' overrides; `super()` runs its own.
+                if kind == "CALLS" and inferred and qualifier != "super":
+                    dispatched.append((src_id, inferred, types, file_path, line))
 
             # A value whose member isn't a symbol refers to what holds it: `Role.ADMIN` -> Role, for a ts enum.
             if kind == "REFERENCES" and not exact and not inferred and not external and qualifier:
@@ -2114,15 +2314,17 @@ class GraphClient:
                 # Guess by name among what the file can reach: the same file, then files it imports, then a
                 # unique match among files those import in turn. Only in its language family, only into tests
                 # from tests, and calls only of what can be called: called on something, e.g. `items.map()`,
-                # a method or a class; else also a function. Not for the language's own names, which calls
-                # of a name not defined, or of its types' methods on unknown values, likely mean: `len(x)`,
-                # `row.get(k)`.
+                # a method or a class; else a function or a class, as methods are only called on something.
+                # Not for the language's own names, which calls of a name not defined, or of its types' methods
+                # on unknown values, likely mean: `len(x)`, `row.get(k)`. Nor of an interface's methods, which
+                # only declare what their types implement.
                 spec = specs[file_path]
-                callable_kinds = ("method", "class") if qualifier is not None else ("function", "method", "class")
+                callable_kinds = ("method", "class") if qualifier is not None else ("function", "class")
                 testing = cls._test_paths.search(file_path) is not None
                 candidates = [
                     (s, f) for s, f, k in by_name.get(target, [])
                     if (k in allowed[kind] if kind in allowed else k in callable_kinds)
+                    and s not in declared
                     and (specs[f].separator, specs[f].packages) == (spec.separator, spec.packages)
                     and (testing or cls._test_paths.search(f) is None)
                 ] if kind != "CALLS" or target not in (spec.builtins if qualifier is None else spec.builtin_methods) else []
@@ -2147,6 +2349,70 @@ class GraphClient:
                     named_edges.append((src_id, dst_id, kind, file_path, line, confidence))
                 if kind == "INHERITS" and confidence == "exact":
                     bases.setdefault(src_id, []).append(dst_id)
+
+        # The methods of each class, interface, or object namespace by name, and the one each belongs to;
+        # go declares methods in any file of their type's package.
+        methods_of: dict[str, dict[str, str]] = {}
+        owner_of: dict[str, str] = {}
+        for symbol_id, (file_path, qualified_name, kind) in where.items():
+            owner, _, name = qualified_name.rpartition(".")
+            holder = next(
+                (by_qualified[(f, owner)][0] for f in {file_path} | package_of.get(file_path, set()) if (f, owner) in by_qualified),
+                None,
+            ) if kind == "method" and owner else None
+            if holder is not None:
+                methods_of.setdefault(holder, {})[name] = symbol_id
+                owner_of[symbol_id] = holder
+
+        # A method overrides its namesake nearest in each of its class's exact bases, including interfaces
+        # it implements. Go's types implement interfaces by having all their methods, so are inferred to.
+        lines = dict(db.execute("SELECT id, start_line FROM symbols"))
+        overrides: list[tuple[str, str, str]] = []  # (method, method it overrides, confidence)
+        for class_id, methods in methods_of.items():
+            for base_id in bases.get(class_id, []):
+                for name, method_id in methods.items():
+                    overridden = next((methods_of[c][name] for c in lineage(base_id) if name in methods_of.get(c, {})), None)
+                    if overridden is not None:
+                        overrides.append((method_id, overridden, "exact"))
+        implemented: dict[str, set[str]] = {}  # go type -> interfaces it implements
+        having: dict[str, set[str]] = {}  # method name -> go types with a method of that name
+        for type_id, methods in methods_of.items():
+            if where[type_id][2] != "interface" and specs[where[type_id][0]].packages:
+                for name in methods:
+                    having.setdefault(name, set()).add(type_id)
+        for interface_id, methods in methods_of.items():
+            if where[interface_id][2] == "interface" and specs[where[interface_id][0]].packages:
+                for type_id in sorted(set.intersection(*(having.get(name, set()) for name in methods))):
+                    implemented.setdefault(type_id, set()).add(interface_id)
+                    named_edges.append((type_id, interface_id, "INHERITS", where[type_id][0], lines[type_id], "inferred"))
+                    overrides += [(methods_of[type_id][name], method_id, "inferred") for name, method_id in methods.items()]
+        overriders: dict[str, set[str]] = {}
+        for method_id, overridden, confidence in overrides:
+            named_edges.append((method_id, overridden, "OVERRIDES", where[method_id][0], lines[method_id], confidence))
+            overriders.setdefault(overridden, set()).add(method_id)
+
+        # A call through a type may run any override of what it calls, in any override's type that is one
+        # of the receiver's: `store.save()` with `store: Base` runs Sub.save for a Sub, but not Other.save
+        # for `store: Sub`. Each is inferred, as which runs depends on the value.
+        subtyping: dict[str, set[str]] = {}  # type -> what it is: its lineage and what those implement
+        called = {(src_id, dst_id, line) for src_id, dst_id, kind, _, line, _ in named_edges if kind == "CALLS"}
+        for index, (src_id, methods, types, file_path, line) in enumerate(dispatched):
+            on_time(index)
+            reached, pending = set(methods), list(methods)
+            while pending:
+                for method_id in overriders.get(pending.pop(), set()) - reached:
+                    reached.add(method_id)
+                    pending.append(method_id)
+            for method_id in sorted(reached - methods):
+                owner = owner_of[method_id]
+                if owner not in subtyping:
+                    subtyping[owner] = set(lineage(owner))
+                    for c in list(subtyping[owner]):
+                        for interface_id in implemented.get(c, set()):
+                            subtyping[owner].update(lineage(interface_id))
+                if types & subtyping[owner] and (src_id, method_id, line) not in called:
+                    called.add((src_id, method_id, line))
+                    named_edges.append((src_id, method_id, "CALLS", file_path, line, "inferred"))
 
         db.executemany("INSERT INTO edges VALUES (?, ?, ?, ?, ?, ?)", import_edges + named_edges)
 
@@ -2216,6 +2482,57 @@ class GraphClient:
         return base_url, aliases
 
     @classmethod
+    def _package_stems(
+        cls,
+        directory: pathlib.PurePosixPath,
+        manifest: dict,
+        subpath: str,
+    ) -> list[str]:
+        """
+        Paths without extensions a package.json's package may have a subpath of in source, most likely first.
+
+        Args:
+            directory: Directory of the package.json, relative to the analyzed root
+            manifest: The package.json's settings
+            subpath: Path in the package as imported, "." for the package itself, "./button" for `@acme/ui/button`
+
+        Returns:
+            Paths relative to the analyzed root: what its exports, or entry fields for the package itself, name, each
+            also in src for built output, then the subpath in its src and in the package
+        """
+
+        # Exports map subpaths, `"./*": "./dist/*.js"`, to targets or conditions of them, `{"import": ..., "types": ...}`.
+        exports = manifest.get("exports")
+        if not (isinstance(exports, dict) and any(key.startswith(".") for key in exports)):
+            exports = {".": exports}
+        entries: list[str] = []
+        for pattern, value in exports.items():
+            prefix, star, suffix = pattern.partition("*")
+            if subpath != pattern and not (star and subpath.startswith(prefix) and subpath.endswith(suffix)):
+                continue
+            pending = [value]
+            while pending:
+                value = pending.pop(0)
+                if isinstance(value, str):
+                    entries.append(value.replace("*", subpath[len(prefix):len(subpath) - len(suffix)]) if star else value)
+                elif isinstance(value, dict):
+                    pending += value.values()
+                elif isinstance(value, list):
+                    pending += value
+        if subpath == ".":
+            entries += [manifest[field] for field in ("source", "types", "typings", "module", "main") if isinstance(manifest.get(field), str)]
+
+        stems: list[str] = []
+        for entry in entries:
+            parts = pathlib.PurePosixPath(os.path.normpath(re.sub(r"(\.d)?\.[cm]?[jt]sx?$", "", entry))).parts
+            stems.append((directory / pathlib.PurePosixPath(*parts)).as_posix() if parts else directory.as_posix())
+            # Built output, `dist/index.js` or `lib/esm/index.js`, is usually built from the same path in src.
+            while parts and parts[0] in ("dist", "build", "lib", "out", "esm", "cjs", "types"):
+                parts = parts[1:]
+            stems.append((directory / "src" / pathlib.PurePosixPath(*parts)).as_posix() if parts else (directory / "src").as_posix())
+        return stems + [(directory / "src" / subpath).as_posix(), (directory / subpath).as_posix()]
+
+    @classmethod
     def _set_meta(cls, db: sqlite3.Connection, **values):
         db.executemany(
             "INSERT OR REPLACE INTO meta VALUES (?, ?)",
@@ -2236,10 +2553,13 @@ def build_graph(
 
     Parses python, javascript, typescript, and go files and stores their
     symbols and the contains, calls (including rendering jsx components),
-    inherits, uses (type references), references (functions, classes, and
-    constants used as values), and imports edges between them. Call before querying a source tree and again after it
-    changes; only changed files are parsed again. If status is "partial", call
-    again to continue.
+    inherits (including implemented interfaces), overrides, uses (type
+    references), references (functions, classes, and constants used as
+    values), and imports edges between them. Call before querying a source
+    tree and again after it changes; only changed files are parsed again. If
+    status is "partial", call again to continue: what was parsed is kept,
+    and edges are resolved once every file is, until then being the last
+    build's.
 
     The graph doesn't follow edits on its own: after changing files, call
     again before querying, or answers describe the code as it was. Rebuilds
@@ -2254,8 +2574,9 @@ def build_graph(
     Returns:
         A dict whose "status" is "complete", "partial", "busy" (another
         build is running on path_to_storage), or "failed" (see "error"),
-        with counts of files, symbols, and edges in the graph, and the
-        "kinds_of_symbols" accepted by search_symbols
+        with counts of files, symbols, and edges in the graph, the
+        "kinds_of_symbols" accepted by search_symbols, and a "note" when
+        calling again won't finish without a larger timeout_after_s
     """
 
     try:
@@ -2381,6 +2702,48 @@ def get_file(
         return {"status": "failed", "error": str(ex)}
 
 @mcp.tool()
+def get_symbols_at(
+    path_to_storage: str,
+    file_path: str,
+    start_line: int,
+    end_line: int | None = None,
+    limit: int = 128,
+) -> dict:
+    """
+    Find the symbols around lines of a file in a code graph, innermost first.
+
+    Use to go from a location to the graph: the first result holds a stack
+    trace's or an error's line, and every result spans some of a diff hunk's
+    lines, given as start_line to end_line. Pass their ids to get_context or
+    get_related. The file spans every line, so it comes last.
+
+    Args:
+        path_to_storage: Full path to the sqlite database file given to
+            build_graph
+        file_path: Path of the file relative to the analyzed root, as in a
+            file symbol's "id"
+        start_line: First line, from 1
+        end_line: Last line; start_line if not given
+        limit: Most results to return
+
+    Returns:
+        A dict whose "status" is the graph's from graph_state, or "failed"
+        (see "error", with "matches" of similar paths), with the
+        "file_path", "start_line" and "end_line" looked up, whether the
+        file is "test" code and "stale" (changed since the build, so lines
+        may have moved), the "results": symbols with "id", "kind",
+        "signature", "start_line", "end_line", and whether they are
+        "exported", the "count" of all found, and whether results were
+        "truncated"
+    """
+
+    try:
+        return client.locate_symbols(path_to_storage, file_path, start_line, end_line, limit)
+    except Exception as ex:
+        log.exception("! failed to get symbols at lines")
+        return {"status": "failed", "error": str(ex)}
+
+@mcp.tool()
 def get_context(
     path_to_storage: str,
     symbol_id: str,
@@ -2391,12 +2754,14 @@ def get_context(
     """
     Describe a symbol in a code graph with everything directly related to it.
 
-    Use before changing a symbol: its callers and subclasses are what a
-    change can break, its callees and uses are what it depends on. Each
-    related symbol's "confidence" is "exact" (resolved through definitions
-    and imports), "inferred" (a method found through the type of what it's
-    called on, e.g. `self.save()` or `s.add()` after `s = Store()`), or
-    "guess" (matched by name only; check these).
+    Use before changing a symbol: its callers, subclasses, and the methods
+    it's overridden_by are what a change can break, its callees and uses are
+    what it depends on. Each related symbol's "confidence" is "exact"
+    (resolved through definitions and imports), "inferred" (a method found
+    through the type of what it's called on, e.g. `self.save()` or `s.add()`
+    after `s = Store()`, an override such a call may run, or a go type
+    having all of an interface's methods), or "guess" (matched by name only;
+    check these).
 
     Args:
         path_to_storage: Full path to the sqlite database file given to
@@ -2418,7 +2783,9 @@ def get_context(
         its "parent" and "members", whether each is "exported",
         the "callers", "callees", "bases", "subclasses", "uses", "used_by",
         "references" (functions, classes, and constants it uses as values,
-        e.g. a callback it passes), and "referenced_by" symbols with "id",
+        e.g. a callback it passes), "referenced_by", "overrides" (the base or
+        interface methods it overrides or implements), and "overridden_by"
+        symbols with "id",
         "kind", "signature", "confidence",
         whether they are "test" code, and "lines" where they refer,
         "counts" of each list before the limit, and the "source" and
@@ -2522,12 +2889,17 @@ def get_related(
     Use to go further than get_context's direct relationships:
     - "callers" shows what a change can break: depth 1 is what calls the
       symbol, depth 2 adds their callers, and so on. Calls of a class are
-      its constructions, and of a jsx component its renders. A function
-      passed as a value, e.g. a callback, is in "referenced_by" instead.
+      its constructions, and of a jsx component its renders. Calls of a
+      method through a base or interface count for its overrides too. A
+      function passed as a value, e.g. a callback, is in "referenced_by"
+      instead.
     - "callees" shows what a symbol depends on before reusing, moving, or
       testing it: depth 1 is what it calls, depth 2 adds what those call.
     - "subclasses" at depth 3 is a class's hierarchy below it, "bases" the
-      one above it.
+      one above it; an interface's subclasses include what implements it.
+    - "overridden_by" shows the methods overriding or implementing a
+      method, which change with its signature; "overrides" the methods it
+      overrides or implements.
     - "used_by" shows what refers to a type, "uses" the types it refers to.
     - "referenced_by" shows what uses a function, class, or constant as a
       value, e.g. `items.map(format)` or `onClick={save}`; "references" the
@@ -2539,7 +2911,9 @@ def get_related(
     Each result's "confidence" is its surest path's least sure edge:
     "exact" (resolved through definitions and imports), "inferred" (a
     method found through the type of what it's called on, e.g. `self.save()`
-    or `s.add()` after `s = Store()`), or "guess" (matched by name only).
+    or `s.add()` after `s = Store()`, an override such a call may run, or a
+    go type having all of an interface's methods), or "guess" (matched by
+    name only).
     Guesses multiply with depth; use skip_guesses to follow only the others.
 
     Args:
@@ -2548,8 +2922,8 @@ def get_related(
         symbol_id: A symbol's "id" from search_symbols, get_file, or
             get_context, like "src/store.py::Store"
         relationship: One of "callers", "callees", "bases", "subclasses",
-            "uses", "used_by", "references", "referenced_by", "members", or
-            "tests"
+            "uses", "used_by", "references", "referenced_by", "overrides",
+            "overridden_by", "members", or "tests"
         depth: How many steps away to follow
         limit: Most results to return
         skip_guesses: Whether to skip edges matched by name only
@@ -2573,6 +2947,8 @@ def get_related(
         "used_by": (("USES",), False),
         "references": (("REFERENCES",), True),
         "referenced_by": (("REFERENCES",), False),
+        "overrides": (("OVERRIDES",), True),
+        "overridden_by": (("OVERRIDES",), False),
         "members": (("CONTAINS",), True),
         "tests": (("CALLS", "REFERENCES"), False),
     }
@@ -2628,10 +3004,6 @@ def ping() -> str:
     return "ok"
 
 def add_to_registry(name: str, role: str, endpoint: str, url: str, port: int):
-    if not endpoint or not url:
-        log.warning("~ endpoint or url not configured")
-        return
-
     deadline = time.monotonic() + 30
 
     while time.monotonic() < deadline:
@@ -2669,6 +3041,16 @@ if __name__ == "__main__":
     . 
     . powered by automanic 🍣
     . """))
+
+    if not registry_url:
+        log.error("! registry url not configured, exiting")
+        sys.exit(1)
+
+    if not endpoint_url:
+        log.error("! endpoint url not configured, exiting")
+        sys.exit(1)
+
+    log.info(f". supporting semantic analysis as {service_name}")
 
     log.info(". available tools:")
     for tool in mcp._tool_manager.list_tools():
