@@ -1,10 +1,10 @@
-FROM python:3-slim
+FROM python:3.13-slim
 
 RUN apt-get update && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /service
 
-RUN pip install --no-cache-dir --root-user-action=ignore --upgrade pip && pip install --no-cache-dir --root-user-action=ignore \
+RUN pip install --quiet --no-cache-dir --root-user-action=ignore --upgrade pip && pip install --no-cache-dir --root-user-action=ignore \
     "dotenv>=0,<1" \
     "uvicorn>=0,<1" \
     "fastapi>=0,<1" \

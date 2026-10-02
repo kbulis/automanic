@@ -283,7 +283,7 @@ def add_to_registry(name: str, role: str, endpoint: str, url: str, port: int):
             timeout=15,
         )
     except IOError:
-        log.exception(". failed to add to registry")
+        log.exception("! failed to add to registry")
 
 
 if __name__ == "__main__":

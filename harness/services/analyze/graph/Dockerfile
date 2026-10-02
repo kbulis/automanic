@@ -6,8 +6,12 @@ WORKDIR /service
 
 RUN pip install --quiet --no-cache-dir --root-user-action=ignore --upgrade pip && pip install --no-cache-dir --root-user-action=ignore \
     "mcp>=2,<3" \
-    "requests>=2,<3" \
-    "discord.py>=2,<3"
+    "tree-sitter==0.25.2" \
+    "tree-sitter-python==0.25.0" \
+    "tree-sitter-javascript==0.25.0" \
+    "tree-sitter-typescript==0.23.2" \
+    "tree-sitter-go==0.25.0" \
+    "requests>=2,<3"
 
 COPY service.py .
 

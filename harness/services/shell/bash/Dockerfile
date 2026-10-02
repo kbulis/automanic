@@ -27,7 +27,7 @@ WORKDIR /service
 RUN python3 -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
-RUN pip install --no-cache-dir --upgrade pip && pip install --no-cache-dir \
+RUN pip install --no-cache-dir --root-user-action=ignore --upgrade pip && pip install --no-cache-dir --root-user-action=ignore \
     "mcp>=2,<3" \
     "requests>=2,<3" \
     "ipython" \

@@ -36,3 +36,16 @@ services:
       - "7002:8000"
     volumes:
       - ./working:/working
+
+  analyze:
+    build:
+      context: ../harness/services/analyze/graph
+    environment:
+      SERVICE_NAME: analyze-graph
+      SERVICE_ROLE: analyze
+      ENDPOINT_URL: http://analyze:8000/mcp
+      REGISTRY_URL: http://orchestrator:8000/registry
+    ports:
+      - "7003:8000"
+    volumes:
+      - ./working:/working
