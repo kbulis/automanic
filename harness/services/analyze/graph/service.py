@@ -100,36 +100,36 @@ class GraphClient:
     class LanguageSpec:
         name: str
         language: tree_sitter.Language
-        definitions: dict[str, str]     # node type -> symbol kind
-        calls: dict[str, str]           # node type -> field holding the callee
-        imports: dict[str, str]         # node type -> field holding the module
-        separator: str                  # module path separator in imports: "." or "/"
-        index_names: list[str]          # file stems that stand for their directory
-        inherits: dict[str, str]        # definition node type -> type of the child holding its bases
-        imported_names: dict[str, str]  # import node type -> field holding names that may be submodules
-        name_fields: dict[str, str]  # definition node type -> field holding its name, when not "name"
-        function_values: list[str]   # value node types that make a variable a function
-        type_annotations: list[str]  # node types holding a type expression, e.g. `x: User`
-        import_calls: list[str]      # callee names whose string argument is a module, e.g. `require`
-        decorators: list[str]        # node types of decorators, which call the definition they apply to
-        docstrings: bool             # the first string in a body documents it
-        default_exports: dict[str, str]  # unnamed `export default` value node type -> kind, named after its file
-        object_values: list[str]     # value node types that make a variable a namespace for its members
-        receivers: dict[str, str]    # definition node type -> field holding the receiver whose type qualifies it
-        kinds_by_type: dict[str, str]  # node type of a definition's "type" child -> kind, e.g. go's struct_type
-        packages: bool               # imports name directories under a go.mod module, whose files share names
+        definitions: dict[str, str]                    # node type -> symbol kind
+        calls: dict[str, str]                          # node type -> field holding the callee
+        imports: dict[str, str]                        # node type -> field holding the module
+        separator: str                                 # module path separator in imports: "." or "/"
+        index_names: list[str]                         # file stems that stand for their directory
+        inherits: dict[str, str]                       # definition node type -> type of the child holding its bases
+        imported_names: dict[str, str]                 # import node type -> field holding names that may be submodules
+        name_fields: dict[str, str]                    # definition node type -> field holding its name, when not "name"
+        function_values: list[str]                     # value node types that make a variable a function
+        type_annotations: list[str]                    # node types holding a type expression, e.g. `x: User`
+        import_calls: list[str]                        # callee names whose string argument is a module, e.g. `require`
+        decorators: list[str]                          # node types of decorators, which call the definition they apply to
+        docstrings: bool                               # the first string in a body documents it
+        default_exports: dict[str, str]                # unnamed `export default` value node type -> kind, named after its file
+        object_values: list[str]                       # value node types that make a variable a namespace for its members
+        receivers: dict[str, str]                      # definition node type -> field holding the receiver whose type qualifies it
+        kinds_by_type: dict[str, str]                  # node type of a definition's "type" child -> kind, e.g. go's struct_type
+        packages: bool                                 # imports name directories under a go.mod module, whose files share names
         declarations: dict[str, tuple[str, str, str]]  # node type -> fields of its names, type, and values, "" if none
-        constructors: list[str]      # value node types that construct a type or call what returns one, e.g. `new Store()`
-        self_names: list[str]        # names for the enclosing class, e.g. `self`, `this`
-        parameter_properties: list[str]  # node types marking a parameter as an attribute, e.g. ts's `private`
-        builtins: frozenset[str]     # the language's own names, which bare calls mean unless defined, e.g. `len`
-        builtin_methods: frozenset[str]  # methods of its own types, which calls on unknown values likely mean
-        value_holders: dict[str, str]  # node type -> field holding names used as values, "" for all children
-        binders: dict[str, str]      # node type -> field binding local names, "" for the node itself
-        elements: list[str]          # jsx element node types, whose capitalized names are components rendered
-        embeddings: list[str]        # node types that embed their type, when unnamed, as a base: go's `struct { *Base }`
-        doc_types: bool              # doc comments type what the code doesn't: jsdoc's `@param {Store} s`
-        visibility: str              # how names are exported: "underscore" (python), "export" (ts, js), "capital" (go)
+        constructors: list[str]                        # value node types that construct a type or call what returns one, e.g. `new Store()`
+        self_names: list[str]                          # names for the enclosing class, e.g. `self`, `this`
+        parameter_properties: list[str]                # node types marking a parameter as an attribute, e.g. ts's `private`
+        builtins: frozenset[str]                       # the language's own names, which bare calls mean unless defined, e.g. `len`
+        builtin_methods: frozenset[str]                # methods of its own types, which calls on unknown values likely mean
+        value_holders: dict[str, str]                  # node type -> field holding names used as values, "" for all children
+        binders: dict[str, str]                        # node type -> field binding local names, "" for the node itself
+        elements: list[str]                            # jsx element node types, whose capitalized names are components rendered
+        embeddings: list[str]                          # node types that embed their type, when unnamed, as a base: go's `struct { *Base }`
+        doc_types: bool                                # doc comments type what the code doesn't: jsdoc's `@param {Store} s`
+        visibility: str                                # how names are exported: "underscore" (python), "export" (ts, js), "capital" (go)
 
     _languages: list[tuple[list[str], LanguageSpec]] = [
         ([".py"],
@@ -580,6 +580,11 @@ class GraphClient:
         {"file"} | {kind for _, spec in _languages for kind in spec.definitions.values()}
     )
 
+    # Version of what parsing extracts, part of each file's hash, so a build after a bump parses every file again,
+    # resuming where it left off when partial. Bump it when parsing records something differently: _extract, _describe,
+    # the language specs, or a grammar; not for changes to resolving, as edges are resolved again on every build.
+    _extractor_version: str = "7"
+
     _ignored_dirs: set[str] = {
         ".git",
         ".cache",
@@ -923,7 +928,7 @@ class GraphClient:
             "start_line": first,
             "end_line": last,
             "test": self._test_paths.search(file_path) is not None,
-            "stale": source is None or hashlib.sha256(source).hexdigest() != found[0],
+            "stale": source is None or self._digest(source) != found[0],
             "results": [{**dict(zip(keys, row)), "exported": bool(row[5])} for row in rows[:max(1, limit)]],
             "count": len(rows),
             "truncated": len(rows) > max(1, limit),
@@ -1006,7 +1011,7 @@ class GraphClient:
             "doc": doc,
             "exported": bool(exported),
             "test": self._test_paths.search(file_path) is not None,
-            "stale": source is None or hashlib.sha256(source).hexdigest() != sha256,
+            "stale": source is None or self._digest(source) != sha256,
             "parent": dict(zip(("id", "kind", "signature"), parent)) if parent else None,
             "members": [
                 {"id": member_id, "kind": member_kind, "signature": member_signature, "exported": bool(member_exported)}
@@ -1117,6 +1122,17 @@ class GraphClient:
             "source": "\n".join(lines[first - 1:last]),
             "truncated": last < wanted,
         }
+
+    @classmethod
+    def _digest(
+        cls,
+        source: bytes,
+    ) -> str:
+        """
+        Hash of a file's source as parsed by this version of extraction, which tells unchanged files from changed ones.
+        """
+
+        return hashlib.sha256(cls._extractor_version.encode() + b"\0" + source).hexdigest()
 
     @classmethod
     def _matches(
@@ -2114,7 +2130,7 @@ class GraphClient:
                     failed += 1
                     continue
 
-                digest = hashlib.sha256(source).hexdigest()
+                digest = cls._digest(source)
                 if known.get(rel_path) == digest:
                     unchanged += 1
                     continue

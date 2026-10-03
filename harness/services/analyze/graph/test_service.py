@@ -860,6 +860,20 @@ def test_resolving_out_of_time_keeps_parsing_and_last_edges(tmp_path, monkeypatc
     assert edges(sqlite3.connect(storage), "CALLS") == {("app.py::main", "lib.py::helper"), ("app.py::added", "lib.py::helper")}
 
 
+def test_extractor_version_parses_files_again(tmp_path, monkeypatch):
+    build(tmp_path, {"lib.py": "def helper(): ...\n", "app.py": "def main(): ...\n"})
+    root, storage = str(tmp_path / "src"), str(tmp_path / "graph.sqlite")
+    assert service.client.build_database(root, storage, 30)["parsed"] == 0
+    assert not service.get_context(storage, "lib.py::helper")["stale"]
+
+    # A new version of extraction parses every file again, though none changed.
+    monkeypatch.setattr(service.GraphClient, "_extractor_version", "next")
+    assert service.get_context(storage, "lib.py::helper")["stale"]
+    result = service.client.build_database(root, storage, 30)
+    assert (result["parsed"], result["unchanged"]) == (2, 0)
+    assert not service.get_context(storage, "lib.py::helper")["stale"]
+
+
 # Search.
 
 def search(tmp_path: pathlib.Path, kind: str, query: str = "") -> list[dict]:
