@@ -9,6 +9,8 @@ import textwrap
 import requests
 import logging
 import json
+import tomllib
+import configparser
 import hashlib
 import pathlib
 import dataclasses
@@ -125,6 +127,8 @@ class GraphClient:
         value_holders: dict[str, str]  # node type -> field holding names used as values, "" for all children
         binders: dict[str, str]      # node type -> field binding local names, "" for the node itself
         elements: list[str]          # jsx element node types, whose capitalized names are components rendered
+        embeddings: list[str]        # node types that embed their type, when unnamed, as a base: go's `struct { *Base }`
+        doc_types: bool              # doc comments type what the code doesn't: jsdoc's `@param {Store} s`
         visibility: str              # how names are exported: "underscore" (python), "export" (ts, js), "capital" (go)
 
     _languages: list[tuple[list[str], LanguageSpec]] = [
@@ -188,6 +192,8 @@ class GraphClient:
                     "as_pattern_target": "",
                 },
                 elements=[],
+                embeddings=[],
+                doc_types=False,
                 visibility="underscore",
                 builtin_methods=frozenset(
                     name
@@ -290,6 +296,7 @@ class GraphClient:
                     "jsx_expression": "",
                     "binary_expression": "",
                     "ternary_expression": "",
+                    "arrow_function": "body",
                 },
                 binders={
                     "formal_parameters": "",
@@ -298,6 +305,8 @@ class GraphClient:
                     "arrow_function": "parameter",
                 },
                 elements=["jsx_opening_element", "jsx_self_closing_element"],
+                embeddings=[],
+                doc_types=False,
                 visibility="export",
             )
         ),
@@ -395,6 +404,7 @@ class GraphClient:
                     "jsx_expression": "",
                     "binary_expression": "",
                     "ternary_expression": "",
+                    "arrow_function": "body",
                 },
                 binders={
                     "formal_parameters": "",
@@ -403,6 +413,8 @@ class GraphClient:
                     "arrow_function": "parameter",
                 },
                 elements=["jsx_opening_element", "jsx_self_closing_element"],
+                embeddings=[],
+                doc_types=False,
                 visibility="export",
             )
         ),
@@ -487,6 +499,7 @@ class GraphClient:
                     "jsx_expression": "",
                     "binary_expression": "",
                     "ternary_expression": "",
+                    "arrow_function": "body",
                 },
                 binders={
                     "formal_parameters": "",
@@ -495,6 +508,8 @@ class GraphClient:
                     "arrow_function": "parameter",
                 },
                 elements=["jsx_opening_element", "jsx_self_closing_element"],
+                embeddings=[],
+                doc_types=True,
                 visibility="export",
             )
         ),
@@ -553,6 +568,8 @@ class GraphClient:
                 },
                 binders={"range_clause": "left"},
                 elements=[],
+                embeddings=["field_declaration", "type_elem"],
+                doc_types=False,
                 visibility="capital",
             )
         ),
@@ -1232,35 +1249,118 @@ class GraphClient:
         if first is not None and first.type == "expression_statement" and first.named_children and first.named_children[0].type == "string":
             content = next((c for c in first.named_children[0].named_children if c.type == "string_content"), None)
             text = content.text if content is not None else None
-        elif node.parent is not None:
-            # Otherwise the comments right above it, past wrappers like `export` and decorators.
-            holder = node
-            while holder.parent is not None and holder.parent.type in (
-                "decorated_definition", "export_statement", "lexical_declaration", "variable_declaration", "expression_statement",
-                "type_declaration", "const_declaration", "var_declaration",
+        elif node.parent is not None or any(c.type == "package_clause" for c in node.named_children):
+            # Otherwise the comments right above it, past wrappers like `export` and decorators; for a go file, those
+            # above its package clause, by convention.
+            text = cls._comments_above(
+                node if node.parent is not None else next(c for c in node.named_children if c.type == "package_clause"), spec,
+            )
+        elif not spec.docstrings:
+            # A file's leading comments, past `#!` lines and directives like "use strict", that aren't a license or a
+            # tool's directive, e.g. `// eslint-disable`, nor the doc of the code right after them, unless they say
+            # they're the file's: `/** @fileoverview Serves files. */`.
+            blocks: list[list[bytes]] = []
+            last_row, following = -2, None
+            for child in node.named_children:
+                if child.type == "comment" and child.text:
+                    if blocks and child.start_point.row <= last_row + 1:
+                        blocks[-1].append(child.text)
+                    else:
+                        blocks.append([child.text])
+                    last_row = child.end_point.row
+                elif child.type != "hash_bang_line" and not (
+                    child.type == "expression_statement" and child.named_children and child.named_children[0].type == "string"
+                ):
+                    following = child
+                    break
+            if (
+                blocks
+                and following is not None
+                and following.start_point.row <= last_row + 1
+                and not re.search(rb"@file(overview)?\b", b"\n".join(blocks[-1]))
             ):
-                holder = holder.parent
-            top = holder.start_point.row
-            above = holder.prev_named_sibling
-            while above is not None and above.type in spec.decorators:
-                top, above = above.start_point.row, above.prev_named_sibling
-            comments: list[bytes] = []
-            while (
-                above is not None
-                and above.type == "comment"
-                and above.end_point.row >= top - 1
-                and above.text
-                # On its own line, not trailing the code before it.
-                and (above.prev_sibling is None or above.prev_sibling.end_point.row < above.start_point.row)
-            ):
-                comments.insert(0, above.text)
-                top, above = above.start_point.row, above.prev_named_sibling
-            text = b"\n".join(comments) or None
+                blocks.pop()
+            text = next(
+                (
+                    re.sub(rb"@(fileoverview|file|packageDocumentation)\b", b"", joined)
+                    for joined in map(b"\n".join, blocks)
+                    if not re.search(rb"(?i)copyright|spdx-license-identifier|@license|\A[/*\s]*(eslint|jshint|prettier-ignore|@ts-|@jsx|@flow\b|<reference\s|global\s|istanbul\s)", joined)
+                ),
+                None,
+            )
 
         # First line with words, without comment markers or quotes.
         lines = (line.strip().strip("/*#'\"").strip() for line in (text or b"").decode("utf-8", errors="replace").splitlines())
         doc = next((line[:200] for line in lines if line), None)
         return signature, doc
+
+    @classmethod
+    def _comments_above(
+        cls,
+        node: tree_sitter.Node,
+        spec: LanguageSpec,
+    ) -> bytes | None:
+        """
+        Comments right above a definition, past wrappers like `export` and decorators: its doc comment.
+        """
+
+        holder = node
+        while holder.parent is not None and holder.parent.type in (
+            "decorated_definition", "export_statement", "lexical_declaration", "variable_declaration", "expression_statement",
+            "type_declaration", "const_declaration", "var_declaration",
+        ):
+            holder = holder.parent
+        top = holder.start_point.row
+        above = holder.prev_named_sibling
+        while above is not None and above.type in spec.decorators:
+            top, above = above.start_point.row, above.prev_named_sibling
+        comments: list[bytes] = []
+        while (
+            above is not None
+            and above.type == "comment"
+            and above.end_point.row >= top - 1
+            and above.text
+            # On its own line, not trailing the code before it.
+            and (above.prev_sibling is None or above.prev_sibling.end_point.row < above.start_point.row)
+        ):
+            comments.insert(0, above.text)
+            top, above = above.start_point.row, above.prev_named_sibling
+        return b"\n".join(comments) or None
+
+    @classmethod
+    def _doc_type(
+        cls,
+        expression: str,
+    ) -> tuple[str, str | None] | None:
+        """
+        Dotted name of the one type a jsdoc type expression names, and the module it's imported from, if any:
+        `?Store` -> ("Store", None), `Promise<Store|null>` -> ("Store", None), `import("./store").Store` ->
+        ("Store", "./store"); None for several or generic ones, `Store[]`.
+        """
+
+        while True:
+            expression = expression.strip().lstrip("?!").rstrip("=").strip()
+            wrapped = re.fullmatch(r"\((.*)\)|Promise\.?<(.*)>", expression, flags=re.S)
+            if wrapped is not None:
+                expression = wrapped[1] if wrapped[1] is not None else wrapped[2]
+                continue
+            # A union of one type and nothing: `Store|null`.
+            parts, depth, start = [], 0, 0
+            for index, character in enumerate(expression):
+                depth += (character in "<({[") - (character in ">)}]")
+                if character == "|" and depth == 0:
+                    parts.append(expression[start:index])
+                    start = index + 1
+            parts = [p.strip() for p in (*parts, expression[start:]) if p.strip() not in ("null", "undefined", "void")]
+            if len(parts) != 1:
+                return None
+            if parts[0] == expression:
+                break
+            expression = parts[0]
+        imported = re.fullmatch(r"""import\(\s*["'](.+?)["']\s*\)\.([\w$.]+)""", expression)
+        if imported is not None:
+            return imported[2], imported[1]
+        return (expression, None) if all(part.replace("$", "_").isidentifier() for part in expression.split(".")) else None
 
     @classmethod
     def _type_name(
@@ -1370,6 +1470,29 @@ class GraphClient:
                 scope_id = parents.get(scope_id)
             return expression
 
+        doc_imports: set[tuple[str, str]] = set()
+
+        def doc_types(node: tree_sitter.Node, line: int) -> list[tuple[str, str, str]]:
+            # What jsdoc's comment above a node types, as (tag, name, type): `@param {Store} s`, `@returns {Store}`,
+            # `@type {Store}`. Types from modules, `import("./store").Store`, import them, binding their names.
+            found = []
+            for tag, expression, name in re.findall(
+                rb"@(param|arg|argument|returns?|type)\s*\{((?:[^{}]|\{[^{}]*\})*)\}\s*\[?([\w$]*)",
+                cls._comments_above(node, spec) or b"",
+            ):
+                typed_as = cls._doc_type(expression.decode("utf-8", errors="replace"))
+                if typed_as is None:
+                    continue
+                type_name, module = typed_as
+                if module is not None and (module, type_name) not in doc_imports:
+                    doc_imports.add((module, type_name))
+                    head = type_name.split(".")[0]
+                    refs.append((rel_path, "IMPORTS", module, rel_path, line, None, None))
+                    bindings.append((rel_path, head, module, head, line))
+                tag = {b"arg": "param", b"argument": "param", b"returns": "return"}.get(tag, tag.decode())
+                found.append((tag, name.decode("utf-8", errors="replace"), type_name))
+            return found
+
         def aliases(name: str, value: tree_sitter.Node | None) -> bool:
             # A local bound to what has its name means the same, so isn't another: python's `deepcopy=deepcopy`
             # default, `_wrap = _bootstrap._wrap`.
@@ -1402,7 +1525,7 @@ class GraphClient:
                 elif around.type == "assignment_expression" and around.child_by_field_name("right") == node and scope_kind == "file":
                     left = around.child_by_field_name("left")
                     assigned = (left.text or b"").decode("utf-8", errors="replace").removeprefix("module.") if left is not None else ""
-                    if assigned == "exports":
+                    if assigned in ("exports", "exports.default"):
                         exported_name = unnamed
                     elif assigned.startswith("exports.") and assigned.removeprefix("exports.").replace("$", "_").isidentifier():
                         exported_name = assigned.removeprefix("exports.")
@@ -1426,6 +1549,8 @@ class GraphClient:
                 if len(values) == 1 and values[0].type == "expression_list":
                     values = values[0].named_children
                 declared = cls._type_name(node.child_by_field_name(type_field)) if type_field else None
+                if declared is None and spec.doc_types:
+                    declared = next((t for tag, _, t in doc_types(node, line) if tag == "type"), None)
                 # ts's `constructor(private store: Store)` is also an attribute.
                 is_property = any(c.type in spec.parameter_properties for c in node.children)
                 for index, name_node in enumerate(names):
@@ -1507,24 +1632,34 @@ class GraphClient:
                 if tag is not None and tag.text and (tag.type != "identifier" or tag.text[:1].isupper()):
                     named.append(("CALLS", scope, tag, line, frame))
 
-            # Commonjs's `module.exports = ...` is what importing the file's default gives, and exports the names it
-            # gives: `module.exports = Store`, `module.exports = { load, save }`, `exports.load = load`.
+            # Commonjs's `module.exports = ...` is what importing the file's default gives, as is `exports.default = ...`,
+            # and exports the names it gives: `module.exports = Store`, `module.exports = { load, save: store }`,
+            # `exports.load = load`. Exporting a name for another, `exports.save = store` or `{ save: store }`, makes
+            # it stand for that.
             if node.type == "assignment_expression" and spec.visibility == "export" and scope_kind == "file":
                 left, right = node.child_by_field_name("left"), node.child_by_field_name("right")
                 assigned = (left.text or b"").decode("utf-8", errors="replace").removeprefix("module.") if left is not None else ""
                 value = (right.text or b"").decode("utf-8", errors="replace") if right is not None else ""
-                if assigned == "exports" and right is not None and right.type in spec.default_exports:
+                dotted = bool(value) and all(part.replace("$", "_").isidentifier() for part in value.split("."))
+                if assigned in ("exports", "exports.default") and right is not None and right.type in spec.default_exports:
                     refs.append((rel_path, "DEFAULT", unnamed, rel_path, line, None, None))
-                    if right.type in spec.object_values:
-                        export_listed.update(
-                            c.text.decode("utf-8", errors="replace") for c in right.named_children
-                            if c.type == "shorthand_property_identifier" and c.text
+                    for pair in right.named_children if right.type in spec.object_values else []:
+                        key, member = (pair, pair) if pair.type == "shorthand_property_identifier" else (
+                            pair.child_by_field_name("key"), pair.child_by_field_name("value"),
                         )
-                elif assigned == "exports" and right is not None and right.type == "identifier":
+                        if key is None or member is None or member.type not in ("identifier", "shorthand_property_identifier") or not member.text:
+                            continue
+                        local = member.text.decode("utf-8", errors="replace")
+                        export_listed.add(local)
+                        if key.text != member.text and key.text:
+                            refs.append((rel_path, "EXPORTS", key.text.decode("utf-8", errors="replace"), rel_path, line, None, local))
+                elif assigned in ("exports", "exports.default") and right is not None and right.type == "identifier":
                     refs.append((rel_path, "DEFAULT", value, rel_path, line, None, None))
                     export_listed.add(value)
-                elif assigned == f"exports.{value}" and right is not None and right.type == "identifier":
+                elif assigned.startswith("exports.") and dotted:
                     export_listed.add(value)
+                    if assigned != f"exports.{value}":
+                        refs.append((rel_path, "EXPORTS", assigned.removeprefix("exports."), rel_path, line, None, value))
 
             if node.type in spec.definitions or default_kind is not None:
                 kind = default_kind or spec.definitions[node.type]
@@ -1543,16 +1678,21 @@ class GraphClient:
                     # as do objects exported themselves, e.g. `module.exports = { get() {} }`.
                     function_valued = any(c.type in spec.function_values for c in node.named_children)
                     namespace = node.type in spec.object_values or any(c.type in spec.object_values for c in node.named_children)
-                    # Names bound to what a module loads are imports, not definitions: `const Store = require("./store")`.
+                    # Names bound to what a module loads are imports, not definitions: `const Store = require("./store")`,
+                    # or as compiled typescript wraps it, `const store_1 = __importDefault(require("./store"))`.
                     value = node.child_by_field_name("value") or node.child_by_field_name("right")
-                    while value is not None and value.type in ("member_expression", "attribute"):
-                        value = value.child_by_field_name("object")
-                    callee = value.child_by_field_name(spec.calls[value.type]) if value is not None and value.type in spec.calls else None
-                    if (
-                        callee is not None
-                        and callee.text is not None
-                        and callee.text.decode("utf-8", errors="replace").rsplit(".", 1)[-1] in spec.import_calls
-                    ):
+                    loader = ""
+                    while value is not None:
+                        if value.type in ("member_expression", "attribute"):
+                            value = value.child_by_field_name("object")
+                            continue
+                        callee = value.child_by_field_name(spec.calls[value.type]) if value.type in spec.calls else None
+                        loader = (callee.text or b"").decode("utf-8", errors="replace").rsplit(".", 1)[-1] if callee is not None else ""
+                        arguments = value.child_by_field_name("arguments") if loader.startswith("__import") and loader not in spec.import_calls else None
+                        if arguments is None or not arguments.named_children:
+                            break
+                        value = arguments.named_children[0]
+                    if loader in spec.import_calls:
                         name_node = None
                     elif (
                         scope_kind not in ("file", "class", "variable")
@@ -1636,6 +1776,16 @@ class GraphClient:
                             type_name = qualifieds.get(enclosing(scope) or "")
                         if type_name is not None:
                             refs.append((symbol_id, "RETURNS", name, rel_path, line, None, type_name))
+                    # Jsdoc types what javascript doesn't: its parameters and what it returns, or a variable; each a use.
+                    if spec.doc_types and kind in ("function", "method", "variable"):
+                        for tag, typed_name, type_name in doc_types(node, line):
+                            if tag == "param" and typed_name and kind != "variable":
+                                key = (symbol_id, typed_name)
+                                local_types[key] = type_name if local_types.get(key, type_name) == type_name else None
+                            elif tag == "return" and kind != "variable" and type_name is not None:
+                                refs.append((symbol_id, "RETURNS", name, rel_path, line, None, type_name))
+                            qualifier, _, target = type_name.rpartition(".")
+                            refs.append((symbol_id, "USES", target, rel_path, line, qualifier or None, None))
                     # Calls in a variable's value belong to the enclosing scope, unless it is a namespace;
                     # its annotation belongs to itself.
                     if kind == "variable":
@@ -1654,6 +1804,34 @@ class GraphClient:
                         elif base.type != "keyword_argument":  # e.g. python's `metaclass=M`
                             named.append(("INHERITS", symbol_id, base, base.start_point.row + 1, frame))
 
+                    # An object typed as an interface implements it: `const repo: Saver = { save() {} }`.
+                    annotation = node.child_by_field_name("type") if namespace and node.type not in spec.object_values else None
+                    declared = annotation.named_children[0] if annotation is not None and annotation.named_children else None
+                    if declared is not None and declared.type == "generic_type":
+                        declared = declared.child_by_field_name("name")
+                    if declared is not None and declared.type in ("type_identifier", "nested_type_identifier"):
+                        named.append(("INHERITS", symbol_id, declared, line, frame))
+
+                    # Go's types embed others, whose fields and methods they then have, as bases: `struct { *Base }`,
+                    # `interface { Reader; io.Writer }`, but not type sets, `interface { ~int | ~string }`. An embedded
+                    # struct is also the field named after it: `s.Base.Save()`.
+                    embedding = [] if not spec.embeddings or type_child is None else [
+                        m for c in type_child.named_children for m in (c.named_children if c.type == "field_declaration_list" else [c])
+                    ]
+                    for member in embedding:
+                        if member.type not in spec.embeddings or member.child_by_field_name("name") is not None:
+                            continue
+                        embedded = member.child_by_field_name("type") or (member.named_children[0] if len(member.named_children) == 1 else None)
+                        if embedded is not None and embedded.type == "generic_type":
+                            embedded = embedded.child_by_field_name("type")
+                        if embedded is None or embedded.type not in ("type_identifier", "qualified_type") or not embedded.text:
+                            continue
+                        named.append(("INHERITS", symbol_id, embedded, embedded.start_point.row + 1, frame))
+                        if member.type == "field_declaration":
+                            type_name = embedded.text.decode("utf-8", errors="replace")
+                            attribute_types.setdefault((symbol_id, type_name.rpartition(".")[2]), type_name)
+                            attribute_lines.setdefault((symbol_id, type_name.rpartition(".")[2]), embedded.start_point.row + 1)
+
                     # Decorators call what they decorate: its own decorator children (ts classes, fields),
                     # plus those right before it (python, ts methods and `export`s). `@app.route("/")` -> route.
                     decorators = [c for c in node.named_children if c.type in spec.decorators]
@@ -1661,9 +1839,14 @@ class GraphClient:
                     while sibling is not None and sibling.type in spec.decorators:
                         decorators.append(sibling)
                         sibling = sibling.prev_named_sibling
+                    # What their arguments call and use as values is the decorated symbol's, in the scope around it:
+                    # `@pytest.mark.parametrize("case", CASES)`, nest's `@Module({ controllers: [UsersController] })`.
                     for decorator in decorators:
                         expression = decorator.named_children[0] if decorator.named_children else None
                         if expression is not None and expression.type in spec.calls:
+                            arguments = expression.child_by_field_name("arguments")
+                            if arguments is not None:
+                                stack.append((arguments, symbol_id, "function", qualified, frame_parents.get(node.id, frame)))
                             expression = expression.child_by_field_name(spec.calls[expression.type])
                         named.append(("CALLS", symbol_id, expression, decorator.start_point.row + 1, frame))
 
@@ -1673,7 +1856,35 @@ class GraphClient:
 
             elif node.type in spec.calls:
                 callee = node.child_by_field_name(spec.calls[node.type])
+                # Compiled typescript calls functions of modules as `(0, store_1.make)()`, so not as methods.
+                while callee is not None and callee.type in ("parenthesized_expression", "sequence_expression") and callee.named_children:
+                    callee = callee.named_children[-1]
                 named.append(("CALLS", scope, callee, line, frame))
+                # Compiled typescript exports names for others with a getter or a value:
+                # `Object.defineProperty(exports, "make", { get: function () { return store_1.make; } })`.
+                arguments = node.child_by_field_name("arguments")
+                given = arguments.named_children if arguments is not None else []
+                if (
+                    callee is not None
+                    and callee.text == b"Object.defineProperty"
+                    and scope_kind == "file"
+                    and len(given) == 3
+                    and (given[0].text or b"").removeprefix(b"module.") == b"exports"
+                    and given[1].type == "string"
+                    and given[2].type in spec.object_values
+                ):
+                    exported = cls._import_target(given[1])
+                    for pair in (c for c in given[2].named_children if c.type in ("pair", "method_definition")):
+                        key = (pair.child_by_field_name("key") or pair.child_by_field_name("name"))
+                        value = pair.child_by_field_name("value") if key is not None and key.text == b"value" else None
+                        getter = (pair.child_by_field_name("value") if pair.type == "pair" else pair) if key is not None and key.text == b"get" else None
+                        body = getter.child_by_field_name("body") if getter is not None else None
+                        if body is not None and body.type == "statement_block":
+                            body = next((c.named_children[0] for c in body.named_children if c.type == "return_statement" and c.named_children), None)
+                        local = (value or body).text.decode("utf-8", errors="replace") if (value or body) is not None and (value or body).text else ""
+                        if exported and exported != "__esModule" and local and all(p.replace("$", "_").isidentifier() for p in local.split(".")):
+                            refs.append((rel_path, "EXPORTS", exported, rel_path, line, None, local))
+                            export_listed.add(local)
                 # `require("./x")`, `import("./x")`, and `importlib.import_module("x")` load a module.
                 arguments = node.child_by_field_name("arguments")
                 first = arguments.named_children[0] if arguments is not None and arguments.named_children else None
@@ -1691,8 +1902,14 @@ class GraphClient:
                         # `const x = require("./x")` and `x = importlib.import_module("x")` bind the module to x;
                         # `const { a, b: c } = require("./x")` and `const a = require("./x").a` bind names in it, and
                         # `module.exports = require("./x")` exports all of them.
-                        holder, member = node.parent, None
-                        if holder is not None and holder.type == "member_expression" and holder.child_by_field_name("object") == node:
+                        # Compiled typescript wraps them: `__importDefault(require("./x"))`, `__exportStar(require("./x"), exports)`.
+                        loaded, wrapper = node, node.parent.parent if node.parent is not None and node.parent.type == "arguments" else None
+                        wrapping = wrapper.child_by_field_name(spec.calls[wrapper.type]) if wrapper is not None and wrapper.type in spec.calls else None
+                        wrapped_by = (wrapping.text or b"").decode("utf-8", errors="replace").rsplit(".", 1)[-1] if wrapping is not None else ""
+                        if wrapped_by.startswith("__import"):
+                            loaded = wrapper
+                        holder, member = loaded.parent, None
+                        if holder is not None and holder.type == "member_expression" and holder.child_by_field_name("object") == loaded:
                             member, holder = holder.child_by_field_name("property"), holder.parent
                         local = (
                             holder.child_by_field_name("name") or holder.child_by_field_name("left")
@@ -1713,7 +1930,7 @@ class GraphClient:
                                         rel_path, value.text.decode("utf-8", errors="replace"), target,
                                         key.text.decode("utf-8", errors="replace"), line,
                                     ))
-                        elif text.removeprefix("module.") == "exports" and member is None and scope_kind == "file":
+                        elif (text.removeprefix("module.") == "exports" and member is None or wrapped_by.endswith("__exportStar")) and scope_kind == "file":
                             bindings.append((rel_path, "*", target, None, line))
 
             elif node.type in spec.type_annotations:
@@ -1949,6 +2166,18 @@ class GraphClient:
             if count % 1024 == 0 and time.monotonic() > deadline:
                 raise TimeoutError("resolving edges timed out")
 
+        listings: dict[pathlib.PurePosixPath, set[str]] = {}
+
+        def has(directory: pathlib.PurePosixPath, name: str) -> bool:
+            # Whether a directory of the tree has a file of a name, listing each directory once, as looking for
+            # each config's name in each directory costs more, on slow file systems most of all.
+            if directory not in listings:
+                try:
+                    listings[directory] = {entry.name for entry in os.scandir(root / directory) if entry.is_file()}
+                except OSError:
+                    listings[directory] = set()
+            return name in listings[directory]
+
         files = {path for (path,) in db.execute("SELECT path FROM files")}
         by_name: dict[str, list[tuple[str, str, str]]] = {}
         by_qualified: dict[tuple[str, str], tuple[str, str]] = {}  # (file, qualified name) -> (id, kind)
@@ -1963,6 +2192,10 @@ class GraphClient:
         for file_path, local, module, name in db.execute("SELECT file_path, local, module, name FROM bindings"):
             bound.setdefault((file_path, local), []).append((module, name))
         defaults = dict(db.execute("SELECT file_path, target FROM refs WHERE kind = 'DEFAULT'"))
+        # Names a file exports for others: `exports.save = store` -> (file, "save") -> "store".
+        exporting = {(file_path, target): receiver for file_path, target, receiver in db.execute(
+            "SELECT file_path, target, receiver FROM refs WHERE kind = 'EXPORTS'"
+        )}
 
         db.execute("DELETE FROM edges")
         db.execute(
@@ -1986,26 +2219,58 @@ class GraphClient:
         modules: dict[str, str] = {}
         for directory in {d for package in packages for d in (pathlib.PurePosixPath(package), *pathlib.PurePosixPath(package).parents)}:
             manifest = root / directory / "go.mod"
-            if manifest.is_file():
+            if has(directory, "go.mod"):
                 declaration = next((l for l in manifest.read_text(errors="replace").splitlines() if l.startswith("module ")), None)
                 if declaration is not None:
                     modules[declaration.split()[1].strip('"')] = directory.as_posix()
 
-        # Packages of the tree by their package.json name, from the directories of js and ts files and those around them.
+        # Packages of the tree by their package.json name, and package.json files by their directory, from the
+        # directories of js and ts files and those around them.
         manifests: dict[str, tuple[pathlib.PurePosixPath, dict]] = {}
+        package_dirs: dict[pathlib.PurePosixPath, dict] = {}
         for directory in sorted({
             d for path, spec in specs.items() if spec.separator == "/" and not spec.packages for d in pathlib.PurePosixPath(path).parents
         }):
             manifest = root / directory / "package.json"
             try:
-                package = json.loads(manifest.read_text(errors="replace")) if manifest.is_file() else None
+                package = json.loads(manifest.read_text(errors="replace")) if has(directory, "package.json") else None
             except (OSError, ValueError) as ex:
                 log.warning(f"~ skipping {manifest}: {ex}")
                 continue
+            if isinstance(package, dict):
+                package_dirs[directory] = package
             if isinstance(package, dict) and isinstance(package.get("name"), str):
                 manifests.setdefault(package["name"], (directory, package))
 
+        # Python distributions of the tree by their top-level import names: the packages each project's packaging
+        # config names, or those in the directories it says hold them, else in its src and itself, with modules too
+        # where it says; though not ones conventionally not shipped, e.g. tests.
+        packages_in: dict[pathlib.PurePosixPath, set[str]] = {}  # directory -> names of packages in it
+        modules_in: dict[pathlib.PurePosixPath, set[str]] = {}  # directory -> names of modules in it
+        for path, spec in specs.items():
+            if spec.separator == ".":
+                posix = pathlib.PurePosixPath(path)
+                if posix.name == "__init__.py":
+                    packages_in.setdefault(posix.parent.parent, set()).add(posix.parent.name)
+                else:
+                    modules_in.setdefault(posix.parent, set()).add(posix.stem)
+        distributions: dict[str, list[str]] = {}
+        for project in sorted({
+            d for path, spec in specs.items() if spec.separator == "." for d in pathlib.PurePosixPath(path).parents
+            if any(has(d, name) for name in ("pyproject.toml", "setup.cfg", "setup.py")) and not has(d, "__init__.py")
+        }):
+            named, roots = cls._python_layout(root / project)
+            found = {name: pathlib.PurePosixPath(os.path.normpath(project / path)) for name, path in named.items()}
+            for holder in roots or ["src", "."]:
+                directory = pathlib.PurePosixPath(os.path.normpath(project / holder))
+                for name in sorted(packages_in.get(directory, set()) | (modules_in.get(directory, set()) if roots else set())):
+                    if name not in cls._unshipped:
+                        found.setdefault(name, directory / name)
+            for name, path in found.items():
+                distributions.setdefault(name, []).append(path.as_posix())
+
         configs: dict[pathlib.PurePosixPath, tuple[str | None, dict[str, list[str]]] | None] = {}  # directory -> its tsconfig's aliases
+        bundlers: dict[pathlib.PurePosixPath, dict[str, list[str]] | None] = {}  # directory -> its vite or webpack config's aliases
         imported: dict[str, set[str]] = {}
         module_files: dict[tuple[str, str], set[str]] = {}  # (importer, module as written) -> files it resolves to
         import_edges: list[tuple] = []
@@ -2050,6 +2315,13 @@ class GraphClient:
                         for directory in (base, *base.parents) if (directory / "__init__.py").as_posix() not in files
                         for layout in ("", "src")
                     ]
+                    # Then a distribution of the tree by its import name, as installed ones are imported from anywhere:
+                    # `from text.clean import strip` in services/api for libs/text/src/text, nearest first.
+                    head, _, rest = module.partition("/")
+                    for directory in sorted(
+                        distributions.get(head, []), key=lambda d: (-len(os.path.commonpath([d, file_path])), d),
+                    ):
+                        stems.append(f"{directory}/{rest}" if rest else directory)
             elif target.startswith("."):
                 # JS/TS: "./x" and "../x" are relative.
                 stems = [(base / target).as_posix()]
@@ -2060,7 +2332,7 @@ class GraphClient:
                 for directory in (base, *base.parents):
                     if directory not in configs:
                         config = next(
-                            (root / directory / name for name in ("tsconfig.json", "jsconfig.json") if (root / directory / name).is_file()),
+                            (root / directory / name for name in ("tsconfig.json", "jsconfig.json") if has(directory, name)),
                             None,
                         )
                         configs[directory] = None if config is None else cls._path_aliases(config, root)
@@ -2068,6 +2340,21 @@ class GraphClient:
                         settings = configs[directory]
                         break
                 base_url, aliases = settings or (None, {})
+                # The aliases of vite and webpack configs in the nearest directory with any, though the tsconfig's win:
+                # `alias: { "@": "/src" }`. Configs listed first win over those after them.
+                for directory in (base, *base.parents):
+                    if directory not in bundlers:
+                        found = [
+                            (root / directory / name, rule)
+                            for name in reversed(cls._bundler_configs) if has(directory, name)
+                            for suffixes, rule in languages if any(name.endswith(suffix) for suffix in suffixes)
+                        ]
+                        bundlers[directory] = {
+                            pattern: substitutions for config, rule in found for pattern, substitutions in cls._bundler_aliases(config, root, rule).items()
+                        } if found else None
+                    if bundlers[directory] is not None:
+                        aliases = {**bundlers[directory], **aliases}
+                        break
 
                 # An exact pattern wins over wildcards, then the longest prefix; its substitutions go in order, then the base url.
                 stems = []
@@ -2078,6 +2365,12 @@ class GraphClient:
                     ):
                         stems = [s.replace("*", target[len(prefix):len(target) - len(suffix)], 1) for s in substitutions]
                         break
+
+                # Or a name in the imports map of the nearest package.json: `#utils/dates`.
+                if target.startswith("#"):
+                    directory = next((d for d in (base, *base.parents) if d in package_dirs), None)
+                    if directory is not None:
+                        stems += cls._package_stems(directory, package_dirs[directory], target)
 
                 # Or a package of the tree by its package.json name, as workspaces import each other: `@acme/ui/button`.
                 name = max((n for n in manifests if target == n or target.startswith(f"{n}/")), key=len, default=None)
@@ -2142,6 +2435,8 @@ class GraphClient:
                 if hit is not None:
                     found.append(hit)
                     continue
+                if (at, names[0]) in exporting:
+                    pending.append((at, (*exporting[(at, names[0])].split("."), *names[1:])))
                 head, rest = names[0], names[1:]
                 reached = False
                 for module, name in bound.get((at, head), []):
@@ -2151,10 +2446,14 @@ class GraphClient:
                             submodule = ".".join((module, *rest[:split])) if split else module
                             if (at, submodule) in module_files:
                                 reached = True
-                                if rest[split:]:
-                                    pending += [(g, rest[split:]) for g in module_files[(at, submodule)]]
-                                # A commonjs module is also what it assigns `module.exports`: `const Store = require("./store")`.
-                                pending += [(g, (defaults[g], *rest[split:])) for g in module_files[(at, submodule)] if g in defaults]
+                                following = rest[split:]
+                                for g in module_files[(at, submodule)]:
+                                    if following:
+                                        pending.append((g, following))
+                                    # A commonjs module is also what it assigns `module.exports`: `const Store = require("./store")`,
+                                    # and its `default` is that: compiled typescript's `store_1.default`.
+                                    if g in defaults:
+                                        pending.append((g, (defaults[g], *(following[1:] if following[:1] == ("default",) else following))))
                                 break
                     else:
                         # A name in the module, which in python may itself be a submodule: `from . import util`.
@@ -2350,10 +2649,9 @@ class GraphClient:
                 if kind == "INHERITS" and confidence == "exact":
                     bases.setdefault(src_id, []).append(dst_id)
 
-        # The methods of each class, interface, or object namespace by name, and the one each belongs to;
-        # go declares methods in any file of their type's package.
+        # The methods of each class, interface, or object namespace by name; go declares methods in any file of
+        # their type's package.
         methods_of: dict[str, dict[str, str]] = {}
-        owner_of: dict[str, str] = {}
         for symbol_id, (file_path, qualified_name, kind) in where.items():
             owner, _, name = qualified_name.rpartition(".")
             holder = next(
@@ -2362,55 +2660,99 @@ class GraphClient:
             ) if kind == "method" and owner else None
             if holder is not None:
                 methods_of.setdefault(holder, {})[name] = symbol_id
-                owner_of[symbol_id] = holder
 
-        # A method overrides its namesake nearest in each of its class's exact bases, including interfaces
-        # it implements. Go's types implement interfaces by having all their methods, so are inferred to.
+        # A method overrides its namesake nearest in each of its class's exact bases, including interfaces it
+        # implements, through that class. Embedding in go isn't overriding, as calls through what is embedded run
+        # its own.
         lines = dict(db.execute("SELECT id, start_line FROM symbols"))
-        overrides: list[tuple[str, str, str]] = []  # (method, method it overrides, confidence)
+        overrides: dict[tuple[str, str], str] = {}  # (method, method it overrides) -> confidence
+        overriders: dict[str, set[tuple[str, str]]] = {}  # method -> (method overriding it, type it does through)
         for class_id, methods in methods_of.items():
+            if specs[where[class_id][0]].packages:
+                continue
             for base_id in bases.get(class_id, []):
                 for name, method_id in methods.items():
                     overridden = next((methods_of[c][name] for c in lineage(base_id) if name in methods_of.get(c, {})), None)
                     if overridden is not None:
-                        overrides.append((method_id, overridden, "exact"))
-        implemented: dict[str, set[str]] = {}  # go type -> interfaces it implements
-        having: dict[str, set[str]] = {}  # method name -> go types with a method of that name
-        for type_id, methods in methods_of.items():
-            if where[type_id][2] != "interface" and specs[where[type_id][0]].packages:
-                for name in methods:
-                    having.setdefault(name, set()).add(type_id)
-        for interface_id, methods in methods_of.items():
-            if where[interface_id][2] == "interface" and specs[where[interface_id][0]].packages:
-                for type_id in sorted(set.intersection(*(having.get(name, set()) for name in methods))):
-                    implemented.setdefault(type_id, set()).add(interface_id)
-                    named_edges.append((type_id, interface_id, "INHERITS", where[type_id][0], lines[type_id], "inferred"))
-                    overrides += [(methods_of[type_id][name], method_id, "inferred") for name, method_id in methods.items()]
-        overriders: dict[str, set[str]] = {}
-        for method_id, overridden, confidence in overrides:
-            named_edges.append((method_id, overridden, "OVERRIDES", where[method_id][0], lines[method_id], confidence))
-            overriders.setdefault(overridden, set()).add(method_id)
+                        overrides[(method_id, overridden)] = "exact"
+                        overriders.setdefault(overridden, set()).add((method_id, class_id))
 
-        # A call through a type may run any override of what it calls, in any override's type that is one
-        # of the receiver's: `store.save()` with `store: Base` runs Sub.save for a Sub, but not Other.save
-        # for `store: Sub`. Each is inferred, as which runs depends on the value.
+        # Structural types are implemented by having all their methods, so types are inferred to, through themselves:
+        # go's interfaces by its types, ts's interfaces by classes not declaring them, and python's protocols, classes
+        # with `Protocol` among their bases, by classes not subclassing them; each within its language family, and
+        # where some file's imports reach both, so values can pass from one to the other. A type's methods are its
+        # own or its bases', as go's promoted from what it embeds, the nearest of each name. Only names say they
+        # match, so not types of only dunders, whose signatures are all they are: `__call__`.
+        protocols = {
+            src_id for src_id, file_path in db.execute("SELECT src_id, file_path FROM refs WHERE kind = 'INHERITS' AND target = 'Protocol'")
+            if specs[file_path].separator == "." and src_id in where
+        }
+        method_sets: dict[str, dict[str, str]] = {}
+        for type_id, (file_path, _, kind) in where.items():
+            if kind in ("class", "interface") or (kind == "type" and specs[file_path].packages):
+                method_sets[type_id] = {}
+                for c in lineage(type_id):
+                    for name, method_id in methods_of.get(c, {}).items():
+                        method_sets[type_id].setdefault(name, method_id)
+        structural = {i for i in method_sets if where[i][2] == "interface" or i in protocols}
+        implemented: dict[str, set[str]] = {}  # type -> structural types it implements
+        having: dict[tuple[str, bool, str], set[str]] = {}  # (family, method name) -> types with a method of that name
+        for type_id, methods in method_sets.items():
+            if type_id not in structural:
+                spec = specs[where[type_id][0]]
+                for name in methods:
+                    having.setdefault((spec.separator, spec.packages, name), set()).add(type_id)
+        importers: dict[str, set[str]] = {}  # file -> files importing it, directly or as their package
+        for path, visible in imported.items():
+            for g in visible:
+                importers.setdefault(g, set()).add(path)
+        reaching: dict[str, set[str]] = {}  # file -> files whose imports reach it, and itself
+
+        def reached_by(path: str) -> set[str]:
+            if path not in reaching:
+                reaching[path], pending = {path}, [path]
+                while pending:
+                    for g in importers.get(pending.pop(), set()) - reaching[path]:
+                        reaching[path].add(g)
+                        pending.append(g)
+            return reaching[path]
+
+        for interface_id, methods in sorted(method_sets.items()):
+            if interface_id not in structural or all(name.startswith("__") and name.endswith("__") for name in methods):
+                continue
+            spec = specs[where[interface_id][0]]
+            for type_id in sorted(set.intersection(*(having.get((spec.separator, spec.packages, name), set()) for name in methods))):
+                if interface_id in lineage(type_id) or not reached_by(where[type_id][0]) & reached_by(where[interface_id][0]):
+                    continue  # declared, so overriding exactly, or out of reach
+                implemented.setdefault(type_id, set()).add(interface_id)
+                named_edges.append((type_id, interface_id, "INHERITS", where[type_id][0], lines[type_id], "inferred"))
+                for name, method_id in methods.items():
+                    overrides.setdefault((method_sets[type_id][name], method_id), "inferred")
+                    overriders.setdefault(method_id, set()).add((method_sets[type_id][name], type_id))
+        for (method_id, overridden), confidence in sorted(overrides.items()):
+            named_edges.append((method_id, overridden, "OVERRIDES", where[method_id][0], lines[method_id], confidence))
+
+        # A call through a type may run any override of what it calls, through any type that is one of the
+        # receiver's: `store.save()` with `store: Base` runs Sub.save for a Sub, but not Other.save for
+        # `store: Sub`. Each is inferred, as which runs depends on the value.
         subtyping: dict[str, set[str]] = {}  # type -> what it is: its lineage and what those implement
         called = {(src_id, dst_id, line) for src_id, dst_id, kind, _, line, _ in named_edges if kind == "CALLS"}
         for index, (src_id, methods, types, file_path, line) in enumerate(dispatched):
             on_time(index)
-            reached, pending = set(methods), list(methods)
+            reached: dict[str, set[str]] = {}  # override -> types it overrides through
+            pending = list(methods)
             while pending:
-                for method_id in overriders.get(pending.pop(), set()) - reached:
-                    reached.add(method_id)
-                    pending.append(method_id)
-            for method_id in sorted(reached - methods):
-                owner = owner_of[method_id]
-                if owner not in subtyping:
-                    subtyping[owner] = set(lineage(owner))
-                    for c in list(subtyping[owner]):
+                for method_id, through in overriders.get(pending.pop(), set()):
+                    if method_id not in methods and through not in reached.setdefault(method_id, set()):
+                        reached[method_id].add(through)
+                        pending.append(method_id)
+            for method_id, throughs in sorted(reached.items()):
+                for through in throughs - subtyping.keys():
+                    subtyping[through] = set(lineage(through))
+                    for c in list(subtyping[through]):
                         for interface_id in implemented.get(c, set()):
-                            subtyping[owner].update(lineage(interface_id))
-                if types & subtyping[owner] and (src_id, method_id, line) not in called:
+                            subtyping[through].update(lineage(interface_id))
+                if any(types & subtyping[through] for through in throughs) and (src_id, method_id, line) not in called:
                     called.add((src_id, method_id, line))
                     named_edges.append((src_id, method_id, "CALLS", file_path, line, "inferred"))
 
@@ -2424,7 +2766,7 @@ class GraphClient:
         seen: frozenset[pathlib.Path] = frozenset(),
     ) -> tuple[str | None, dict[str, list[str]]]:
         """
-        Base url and path aliases of a tsconfig or jsconfig, following its relative extends and references.
+        Base url and path aliases of a tsconfig or jsconfig, following its extends and references.
 
         Args:
             config: Path to the config file
@@ -2455,9 +2797,17 @@ class GraphClient:
         aliases: dict[str, list[str]] = {}
         extends = settings.get("extends")
         for parent in [extends] if isinstance(extends, str) else extends if isinstance(extends, list) else []:
-            if isinstance(parent, str) and parent.startswith("."):
-                path = config.parent / parent
-                parent_base_url, parent_aliases = cls._path_aliases(path if path.is_file() else path.with_name(f"{path.name}.json"), root, seen)
+            if not isinstance(parent, str):
+                continue
+            # Relative, or a package's, found as node finds packages: in node_modules of its directory or one above.
+            path = config.parent / parent if parent.startswith(".") else next(
+                (d / "node_modules" / parent for d in (config.parent, *config.parent.parents) if (d / "node_modules").is_dir()
+                 and any(p.exists() for p in (d / "node_modules" / parent, d / "node_modules" / f"{parent}.json"))),
+                None,
+            )
+            if path is not None:
+                path = path if path.is_file() else path / "tsconfig.json" if path.is_dir() else path.with_name(f"{path.name}.json")
+                parent_base_url, parent_aliases = cls._path_aliases(path, root, seen)
                 base_url, aliases = parent_base_url or base_url, parent_aliases or aliases
 
         options = settings.get("compilerOptions")
@@ -2481,6 +2831,172 @@ class GraphClient:
                 base_url, aliases = base_url or referenced_base_url, {**referenced_aliases, **aliases}
         return base_url, aliases
 
+    # Top-level names of python packages and modules that projects conventionally don't ship, as setuptools' discovery.
+    _unshipped: set[str] = {
+        "tests", "test", "testing", "docs", "doc", "examples", "example", "scripts", "tools", "benchmarks", "build",
+        "dist", "setup", "conftest", "noxfile",
+    }
+
+    @classmethod
+    def _python_layout(
+        cls,
+        project: pathlib.Path,
+    ) -> tuple[dict[str, str], list[str]]:
+        """
+        Where a python project's packaging config puts what it ships, from its pyproject.toml, setup.cfg, or setup.py.
+
+        Args:
+            project: Directory of the project's packaging config
+
+        Returns:
+            Paths relative to the project of the packages it names, by import name: setuptools' `package-dir`
+            `{acme = "source/acme_impl"}`, poetry's `{include = "acme", from = "lib"}`, hatch's `["src/acme"]`; and
+            of directories it says hold the others: setuptools' `{"" = "lib"}` and `find.where`, pdm's
+            `package-dir`; empty if it doesn't say
+        """
+
+        named: dict[str, str] = {}
+        roots: list[str] = []
+
+        def get(table: object, *keys: str) -> object:
+            # A value nested in toml tables, or None.
+            for key in keys:
+                table = table.get(key) if isinstance(table, dict) else None
+            return table
+
+        try:
+            pyproject = project / "pyproject.toml"
+            settings = tomllib.loads(pyproject.read_text(errors="replace")) if pyproject.is_file() else {}
+        except (OSError, tomllib.TOMLDecodeError) as ex:
+            log.warning(f"~ skipping {project / 'pyproject.toml'}: {ex}")
+            settings = {}
+        package_dir = get(settings, "tool", "setuptools", "package-dir")
+        for name, path in package_dir.items() if isinstance(package_dir, dict) else []:
+            if isinstance(path, str) and not name:
+                roots.append(path)
+            elif isinstance(path, str) and name.isidentifier():
+                named[name] = path
+        where = get(settings, "tool", "setuptools", "packages", "find", "where")
+        roots += [path for path in where if isinstance(path, str)] if isinstance(where, list) else []
+        poetry = get(settings, "tool", "poetry", "packages")
+        for entry in poetry if isinstance(poetry, list) else []:
+            include, origin = get(entry, "include"), get(entry, "from")
+            if isinstance(include, str) and include.split("/")[0].isidentifier():
+                named[include.split("/")[0]] = os.path.join(origin if isinstance(origin, str) else "", include.split("/")[0])
+        for hatch in (get(settings, "tool", "hatch", "build", "packages"), get(settings, "tool", "hatch", "build", "targets", "wheel", "packages")):
+            for path in hatch if isinstance(hatch, list) else []:
+                if isinstance(path, str) and pathlib.PurePosixPath(path).name.isidentifier():
+                    named[pathlib.PurePosixPath(path).name] = path
+        pdm = get(settings, "tool", "pdm", "build", "package-dir")
+        if isinstance(pdm, str):
+            roots.append(pdm)
+
+        # setup.cfg's `package_dir = =src` or `acme = source/acme_impl` lines, and `where = src` to find them.
+        try:
+            config = configparser.ConfigParser()
+            config.read_string((project / "setup.cfg").read_text(errors="replace") if (project / "setup.cfg").is_file() else "")
+            for line in config.get("options", "package_dir", fallback="").splitlines():
+                name, _, path = (part.strip() for part in line.partition("="))
+                if path and not name:
+                    roots.append(path)
+                elif path and name.isidentifier():
+                    named[name] = path
+            if config.get("options.packages.find", "where", fallback="").strip():
+                roots.append(config.get("options.packages.find", "where").strip())
+        except (OSError, configparser.Error) as ex:
+            log.warning(f"~ skipping {project / 'setup.cfg'}: {ex}")
+
+        # setup.py's `package_dir={"": "lib"}` and `find_packages(where="src")`, read as text, as it is code.
+        try:
+            text = (project / "setup.py").read_text(errors="replace") if (project / "setup.py").is_file() else ""
+        except OSError as ex:
+            log.warning(f"~ skipping {project / 'setup.py'}: {ex}")
+            text = ""
+        mapping = re.search(r"package_dir\s*=\s*\{([^}]*)\}", text)
+        for name, path in re.findall(r"""["']([\w]*)["']\s*:\s*["']([^"']+)["']""", mapping[1] if mapping else ""):
+            if name:
+                named[name] = path
+            else:
+                roots.append(path)
+        roots += re.findall(r"""find_(?:namespace_)?packages\(\s*(?:where\s*=\s*)?["']([^"']+)["']""", text)
+        return named, list(dict.fromkeys(path.strip("/") or "." for path in roots))
+
+    # Bundler configs that may alias imports, nearest first in each directory.
+    _bundler_configs: list[str] = [
+        f"{tool}.config.{suffix}" for tool in ("vite", "vitest", "webpack") for suffix in ("ts", "js", "mjs", "cjs")
+    ]
+
+    @classmethod
+    def _bundler_aliases(
+        cls,
+        config: pathlib.Path,
+        root: pathlib.Path,
+        spec: LanguageSpec,
+    ) -> dict[str, list[str]]:
+        """
+        Import aliases of a vite or webpack config, as tsconfig path patterns.
+
+        Args:
+            config: Path to the config file
+            root: Directory the returned paths are relative to
+            spec: Language of the config file
+
+        Returns:
+            Each alias pattern's substitutions: `alias: { "@": path.resolve(__dirname, "src") }` -> {"@": ["src"],
+            "@/*": ["src/*"]}, and webpack's exact `"x$"` -> {"x": [...]}
+        """
+
+        try:
+            tree = tree_sitter.Parser(spec.language).parse(config.read_bytes())
+        except (OSError, ValueError) as ex:
+            log.warning(f"~ skipping {config}: {ex}")
+            return {}
+
+        def text(node: tree_sitter.Node | None) -> str | None:
+            # A key's or string's text: `"@"`, `components`.
+            if node is None or node.type not in ("string", "property_identifier", "identifier"):
+                return None
+            return cls._import_target(node)
+
+        # `alias: { "@": ... }`, or vite's `alias: [{ find: "@", replacement: ... }]`.
+        found: list[tuple[str, tree_sitter.Node]] = []
+        pending = [tree.root_node]
+        while pending:
+            node = pending.pop()
+            pending.extend(node.named_children)
+            value = node.child_by_field_name("value") if node.type == "pair" and text(node.child_by_field_name("key")) == "alias" else None
+            for entry in value.named_children if value is not None and value.type in ("object", "array") else []:
+                if entry.type == "pair" and text(entry.child_by_field_name("key")) is not None and entry.child_by_field_name("value") is not None:
+                    found.append((text(entry.child_by_field_name("key")) or "", entry.child_by_field_name("value")))
+                elif entry.type == "object":
+                    fields = {
+                        text(p.child_by_field_name("key")): p.child_by_field_name("value") for p in entry.named_children if p.type == "pair"
+                    }
+                    find, replacement = fields.get("find"), fields.get("replacement")
+                    if find is not None and find.type == "string" and replacement is not None:
+                        found.append((text(find) or "", replacement))
+
+        # Replacements are paths from the config's directory, given in pieces: `path.resolve(__dirname, "src")`,
+        # `"/src"`, `` `${__dirname}/src` ``, `new URL("./src", import.meta.url)`.
+        aliases: dict[str, list[str]] = {}
+        for find, replacement in found:
+            pieces, nodes = [], [replacement]
+            while nodes:
+                node = nodes.pop(0)
+                if node.type == "string_fragment" and node.text:
+                    pieces.append(node.text.decode("utf-8", errors="replace").lstrip("/"))
+                else:
+                    nodes[:0] = node.named_children
+            if not find or not pieces:
+                continue
+            target = os.path.relpath(os.path.normpath(os.path.join(config.parent, *pieces)), root)
+            if find.endswith("$"):
+                aliases[find[:-1]] = [target]
+            else:
+                aliases[find] = [target]
+                aliases[f"{find.rstrip('/')}/*"] = [f"{target}/*"]
+        return aliases
+
     @classmethod
     def _package_stems(
         cls,
@@ -2494,16 +3010,20 @@ class GraphClient:
         Args:
             directory: Directory of the package.json, relative to the analyzed root
             manifest: The package.json's settings
-            subpath: Path in the package as imported, "." for the package itself, "./button" for `@acme/ui/button`
+            subpath: Path in the package as imported, "." for the package itself, "./button" for `@acme/ui/button`,
+                or a name in its imports map, `#utils/dates`
 
         Returns:
-            Paths relative to the analyzed root: what its exports, or entry fields for the package itself, name, each
-            also in src for built output, then the subpath in its src and in the package
+            Paths relative to the analyzed root: what its exports or imports map, or entry fields for the package itself,
+            name, each also in src for built output, then the subpath in its src and in the package
         """
 
-        # Exports map subpaths, `"./*": "./dist/*.js"`, to targets or conditions of them, `{"import": ..., "types": ...}`.
-        exports = manifest.get("exports")
-        if not (isinstance(exports, dict) and any(key.startswith(".") for key in exports)):
+        # Exports map subpaths, `"./*": "./dist/*.js"`, and imports map private names, `"#utils/*": "./src/utils/*.js"`,
+        # to targets or conditions of them, `{"import": ..., "types": ...}`.
+        exports = manifest.get("imports") if subpath.startswith("#") else manifest.get("exports")
+        if subpath.startswith("#"):
+            exports = exports if isinstance(exports, dict) else {}
+        elif not (isinstance(exports, dict) and any(key.startswith(".") for key in exports)):
             exports = {".": exports}
         entries: list[str] = []
         for pattern, value in exports.items():
@@ -2530,6 +3050,8 @@ class GraphClient:
             while parts and parts[0] in ("dist", "build", "lib", "out", "esm", "cjs", "types"):
                 parts = parts[1:]
             stems.append((directory / "src" / pathlib.PurePosixPath(*parts)).as_posix() if parts else (directory / "src").as_posix())
+        if subpath.startswith("#"):
+            return stems
         return stems + [(directory / "src" / subpath).as_posix(), (directory / subpath).as_posix()]
 
     @classmethod

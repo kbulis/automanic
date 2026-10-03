@@ -180,6 +180,115 @@ def test_commonjs_exports_and_requires_resolve(tmp_path):
     assert {".eslintrc.js::eslintrc", ".eslintrc.js::eslintrc.env"} <= exported
 
 
+def test_commonjs_renamed_and_compiled_exports(tmp_path):
+    db = build(tmp_path, {
+        # As typescript compiles to commonjs.
+        "lib/store.js": """
+            "use strict";
+            Object.defineProperty(exports, "__esModule", { value: true });
+            exports.make = exports.Store = void 0;
+            class Store {
+                add() { }
+            }
+            exports.Store = Store;
+            function make() { return new Store(); }
+            exports.make = make;
+            exports.default = Store;
+        """,
+        "lib/index.js": """
+            "use strict";
+            Object.defineProperty(exports, "__esModule", { value: true });
+            exports.build = void 0;
+            const store_1 = require("./store");
+            Object.defineProperty(exports, "build", { enumerable: true, get: function () { return store_1.make; } });
+            __exportStar(require("./extra"), exports);
+        """,
+        "lib/extra.js": "function extra() { }\nexports.extra = extra;\n",
+        # Names exported for others.
+        "renamed.js": "function inner() {}\nexports.publicName = inner;\n",
+        "object.js": "function run() {}\nfunction hidden() {}\nmodule.exports = { start: run };\n",
+        "app.js": """
+            const store_1 = __importDefault(require("./lib/store"));
+            const lib_1 = require("./lib");
+            const { publicName } = require("./renamed");
+            const { start } = require("./object");
+            function main() {
+                new store_1.default();
+                (0, lib_1.build)();
+                (0, lib_1.extra)();
+                publicName();
+                start();
+            }
+        """,
+    })
+    assert edges_from(db, "app.js::main", "CALLS") == {
+        ("lib/store.js::Store", "exact"),   # the default
+        ("lib/store.js::make", "exact"),    # exported by a getter, as `build`
+        ("lib/extra.js::extra", "exact"),   # exported with all of its module's
+        ("renamed.js::inner", "exact"),
+        ("object.js::run", "exact"),
+    }
+    found = symbols(db)
+    assert "app.js::store_1" not in found and "app.js::lib_1" not in found
+    exported = {i for (i,) in db.execute("SELECT id FROM symbols WHERE exported")}
+    assert {"lib/store.js::Store", "lib/store.js::make", "renamed.js::inner", "object.js::run"} <= exported
+    assert "object.js::hidden" not in exported
+
+
+def test_bundler_aliases_imports_maps_and_package_extends(tmp_path):
+    db = build(tmp_path, {
+        # Vite's object form, from the config's directory in pieces.
+        "web/vite.config.ts": """
+            import path from "path";
+            export default defineConfig({
+              resolve: { alias: { "@": path.resolve(__dirname, "src"), "~lib": "/lib" } },
+            });
+        """,
+        "web/src/util.ts": "export function util() {}\n",
+        "web/lib/index.ts": "export function lib() {}\n",
+        "web/src/app.ts": """
+            import { util } from "@/util";
+            import { lib } from "~lib";
+            export function main() { util(); lib(); }
+        """,
+        # Vite's array form and webpack's exact `$`.
+        "admin/webpack.config.js": """
+            module.exports = {
+              resolve: { alias: { shared$: path.resolve(__dirname, "shared/index.js") } },
+            };
+        """,
+        "admin/vitest.config.mjs": """
+            export default { resolve: { alias: [{ find: "#root", replacement: new URL("./src", import.meta.url).pathname }] } };
+        """,
+        "admin/shared/index.js": "export function share() {}\n",
+        "admin/src/x.js": "export function x() {}\n",
+        "admin/src/page.js": """
+            import { share } from "shared";
+            import { x } from "#root/x";
+            export function page() { share(); x(); }
+        """,
+        # An imports map, and a tsconfig extending one from a package.
+        "api/package.json": '{"name": "api", "imports": {"#db": "./src/db.js", "#utils/*": "./dist/utils/*.js"}}',
+        "api/tsconfig.json": '{"extends": "@acme/tsconfig/base.json"}',
+        "api/node_modules/@acme/tsconfig/base.json": '{"compilerOptions": {"baseUrl": "../../../src"}}',
+        "api/src/db.ts": "export function connect() {}\n",
+        "api/src/utils/dates.ts": "export function today() {}\n",
+        "api/src/models.ts": "export function model() {}\n",
+        "api/src/server.ts": """
+            import { connect } from "#db";
+            import { today } from "#utils/dates";
+            import { model } from "models";
+            export function start() { connect(); today(); model(); }
+        """,
+    })
+    assert edges_from(db, "web/src/app.ts::main", "CALLS") == {("web/src/util.ts::util", "exact"), ("web/lib/index.ts::lib", "exact")}
+    # Every config in the nearest directory with any.
+    assert edges_from(db, "admin/src/page.js::page", "CALLS") == {("admin/shared/index.js::share", "exact"), ("admin/src/x.js::x", "exact")}
+    assert edges_from(db, "api/src/server.ts::start", "CALLS") == {
+        ("api/src/db.ts::connect", "exact"), ("api/src/utils/dates.ts::today", "exact"), ("api/src/models.ts::model", "exact"),
+    }
+
+
 def test_ts_workspace_packages_resolve(tmp_path):
     db = build(tmp_path, {
         "package.json": '{"name": "acme", "workspaces": ["packages/*", "apps/*"]}',
@@ -246,6 +355,55 @@ def test_python_project_roots_resolve(tmp_path):
         ("services/api/app/models.py::User", "exact"),
     }
     assert edges_from(db, "libs/text/tests/test_clean.py::test_strip", "CALLS") == {("libs/text/src/text/clean.py::strip", "exact")}
+
+
+def test_python_distributions_resolve_from_anywhere(tmp_path):
+    db = build(tmp_path, {
+        # src layout, found by default; its tests aren't shipped.
+        "libs/text/pyproject.toml": "[project]\nname = 'text'\n",
+        "libs/text/src/text/__init__.py": "",
+        "libs/text/src/text/clean.py": "def strip(s): ...\n",
+        "libs/text/tests/__init__.py": "",
+        "libs/text/tests/helpers.py": "def fixture(): ...\n",
+        # Renamed by setuptools' package-dir.
+        "libs/acme/pyproject.toml": "[tool.setuptools.package-dir]\nacme = 'source/acme_impl'\n",
+        "libs/acme/source/acme_impl/__init__.py": "",
+        "libs/acme/source/acme_impl/core.py": "def run(): ...\n",
+        # Poetry's include from a directory.
+        "libs/poet/pyproject.toml": "[tool.poetry]\nname = 'poet'\npackages = [{ include = 'poet', from = 'lib' }]\n",
+        "libs/poet/lib/poet/__init__.py": "def verse(): ...\n",
+        # setup.cfg's package_dir, and setup.py's find_packages, with modules too.
+        "libs/cfg/setup.cfg": "[options]\npackage_dir =\n    =code\n",
+        "libs/cfg/code/cfgpkg/__init__.py": "def load(): ...\n",
+        "libs/old/setup.py": "from setuptools import setup, find_packages\nsetup(packages=find_packages('lib'))\n",
+        "libs/old/lib/legacy.py": "def ancient(): ...\n",
+        # A setup.py in a package is a module of it, not a project's packaging.
+        "tools/runner/__init__.py": "",
+        "tools/runner/setup.py": "def configure(): ...\n",
+        "tools/runner/jobs/__init__.py": "def queue(): ...\n",
+        "services/api/app/__init__.py": "",
+        "services/api/app/main.py": """
+            from text.clean import strip
+            from acme.core import run
+            from poet import verse
+            from cfgpkg import load
+            from legacy import ancient
+            from tests.helpers import fixture
+            from jobs import queue
+            mod = __import__("os")
+            def handler():
+                strip(""); run(); verse(); load(); ancient(); fixture(); queue()
+        """,
+    })
+    assert edges_from(db, "services/api/app/main.py::handler", "CALLS") == {
+        ("libs/text/src/text/clean.py::strip", "exact"),
+        ("libs/acme/source/acme_impl/core.py::run", "exact"),
+        ("libs/poet/lib/poet/__init__.py::verse", "exact"),
+        ("libs/cfg/code/cfgpkg/__init__.py::load", "exact"),
+        ("libs/old/lib/legacy.py::ancient", "exact"),
+    }
+    # `mod = __import__("os")` binds a module, so isn't a definition.
+    assert "services/api/app/main.py::mod" not in symbols(db)
 
 
 # 3. Signatures and docs.
@@ -324,6 +482,53 @@ def test_typescript_signatures_and_docs(tmp_path):
     assert found["ui.tsx::Id"] == ("type", "type Id = string | number", None)
 
 
+def test_file_docs_of_ts_js_and_go(tmp_path):
+    db = build(tmp_path, {
+        "serve.js": """
+            #!/usr/bin/env node
+            'use strict';
+            // Copyright 2024 Acme. All rights reserved.
+
+            /* eslint-disable no-console */
+
+            /**
+             * Serves files from a directory.
+             */
+
+            /** Starts serving. */
+            function serve() {}
+        """,
+        "env.d.ts": '/// <reference types="vite/client" />\n',
+        "attached.ts": """
+            /** Loads the config. */
+            export function load() {}
+        """,
+        "overview.ts": """
+            /**
+             * @fileoverview Shared helpers for dates.
+             */
+            export function today() {}
+        """,
+        "go.mod": "module example.com/app\n",
+        "store/store.go": """
+            // Copyright 2024 Acme.
+
+            // Package store holds items.
+            package store
+        """,
+        "store/other.go": "package store\n",
+    })
+    found = symbols(db)
+    assert found["serve.js"][2] == "Serves files from a directory."
+    assert found["serve.js::serve"][2] == "Starts serving."
+    # A comment right above the first code documents that code, unless it says it's the file's.
+    assert found["attached.ts"][2] is None and found["attached.ts::load"][2] == "Loads the config."
+    assert found["overview.ts"][2] == "Shared helpers for dates."
+    assert found["env.d.ts"][2] is None
+    assert found["store/store.go"][2] == "Package store holds items."
+    assert found["store/other.go"][2] is None
+
+
 # 4. Decorators.
 
 def test_python_decorators_call_from_decorated(tmp_path):
@@ -376,6 +581,42 @@ def test_typescript_decorators_stay_on_their_member(tmp_path):
         ("ng.ts::Widget.both", "ng.ts::Input"),
         ("ng.ts::Widget.both", "ng.ts::HostListener"),
     }
+
+
+def test_decorator_arguments_are_the_decorated_symbols(tmp_path):
+    db = build(tmp_path, {
+        "cases.py": """
+            import pytest
+            CASES = [1, 2]
+            def check(value): ...
+            def ids(value): ...
+            @pytest.mark.parametrize("case", CASES, ids=ids)
+            def test_cases(case): ...
+            class Model:
+                @validator(check)
+                def name(self, check): ...
+        """,
+        "users.module.ts": """
+            import { Module } from "@nestjs/common";
+            export class UsersController {}
+            export class UsersService {}
+            export class Dto {}
+            export function make() { return 1; }
+            @Module({ controllers: [UsersController], providers: [UsersService], imports: [make()] })
+            export class UsersModule {
+              @Type(() => Dto)
+              item: Dto;
+            }
+        """,
+    })
+    assert edges_from(db, "cases.py::test_cases", "REFERENCES") == {("cases.py::CASES", "exact"), ("cases.py::ids", "exact")}
+    # In the scope around the definition, not its own, whose parameter `check` is another.
+    assert edges_from(db, "cases.py::Model.name", "REFERENCES") == {("cases.py::check", "exact")}
+    assert edges_from(db, "users.module.ts::UsersModule", "REFERENCES") == {
+        ("users.module.ts::UsersController", "exact"), ("users.module.ts::UsersService", "exact"),
+    }
+    assert ("users.module.ts::make", "exact") in edges_from(db, "users.module.ts::UsersModule", "CALLS")
+    assert edges_from(db, "users.module.ts::UsersModule.item", "REFERENCES") == {("users.module.ts::Dto", "exact")}
 
 
 # 5. Default exports and object namespaces.
@@ -1376,6 +1617,78 @@ def test_ts_implements_interfaces(tmp_path):
     assert exported == {"store.ts::Saver.save": 1}
 
 
+def test_python_protocols_are_implemented_structurally(tmp_path):
+    db = build(tmp_path, {
+        "saving.py": """
+            from typing import Protocol
+            class Saver(Protocol):
+                def save(self): ...
+                def close(self): ...
+            class Base:
+                def close(self): ...
+            class Disk(Base):
+                def save(self): ...
+            class Partial:
+                def save(self): ...
+            class Declared(Saver):
+                def save(self): ...
+            def persist(saver: Saver):
+                saver.save()
+            class Callback(Protocol):
+                def __call__(self): ...
+            class Handler:
+                def __call__(self): ...
+        """,
+        "elsewhere.py": """
+            class Unrelated:
+                def save(self): ...
+                def close(self): ...
+        """,
+    })
+    inherits = set(db.execute("SELECT src_id, dst_id, confidence FROM edges WHERE kind = 'INHERITS'"))
+    # Having all its methods, its own or its bases', implements it; subclassing it is declaring it.
+    assert ("saving.py::Disk", "saving.py::Saver", "inferred") in inherits
+    assert ("saving.py::Declared", "saving.py::Saver", "exact") in inherits
+    assert not {(src, dst) for src, dst, _ in inherits if src == "saving.py::Partial"}
+    # Not by dunders alone, which say nothing without signatures, nor where nothing reaches both.
+    assert not {(src, dst) for src, dst, _ in inherits if src in ("saving.py::Handler", "elsewhere.py::Unrelated")}
+    assert set(db.execute("SELECT src_id, dst_id, confidence FROM edges WHERE kind = 'OVERRIDES'")) == {
+        ("saving.py::Disk.save", "saving.py::Saver.save", "inferred"),
+        ("saving.py::Base.close", "saving.py::Saver.close", "inferred"),
+        ("saving.py::Declared.save", "saving.py::Saver.save", "exact"),
+    }
+    assert edges_from(db, "saving.py::persist", "CALLS") == {
+        ("saving.py::Saver.save", "inferred"), ("saving.py::Disk.save", "inferred"), ("saving.py::Declared.save", "inferred"),
+    }
+
+
+def test_ts_interfaces_are_implemented_structurally(tmp_path):
+    db = build(tmp_path, {
+        "saving.ts": """
+            export interface Saver {
+              save(): void;
+            }
+            export class Disk {
+              save() {}
+            }
+            export const memory: Saver = {
+              save() {},
+            };
+            export function persist(saver: Saver) {
+              saver.save();
+            }
+        """,
+    })
+    inherits = set(db.execute("SELECT src_id, dst_id, confidence FROM edges WHERE kind = 'INHERITS'"))
+    assert inherits == {
+        ("saving.ts::Disk", "saving.ts::Saver", "inferred"),    # having its methods
+        ("saving.ts::memory", "saving.ts::Saver", "exact"),     # typed as it
+    }
+    assert edges_from(db, "saving.ts::persist", "CALLS") == {
+        ("saving.ts::Saver.save", "inferred"), ("saving.ts::Disk.save", "inferred"), ("saving.ts::memory.save", "inferred"),
+    }
+
+
 def test_go_types_implement_interfaces(tmp_path):
     db = build(tmp_path, {
         "go.mod": "module example.com/app\n",
@@ -1451,6 +1764,121 @@ def test_local_names_shadow_bare_calls(tmp_path):
     assert edges_from(db, "copy.py::local", "CALLS") == set()
     # A function defined in one is its symbol, though a parameter has its name too.
     assert edges_from(db, "copy.py::nested", "CALLS") == {("copy.py::nested.onexc", "exact")}
+
+
+def test_go_embedding_promotes_and_implements(tmp_path):
+    db = build(tmp_path, {
+        "go.mod": "module example.com/app\n",
+        "store/store.go": """
+            package store
+
+            import "sync"
+
+            type Reader interface{ Read() string }
+            type Closer interface{ Close() error }
+            type ReadCloser interface {
+            	Reader
+            	Closer
+            }
+            type Numbers interface{ ~int | ~float64 }
+
+            type Base struct{}
+
+            func (b *Base) Read() string { return "" }
+            func (b *Base) Close() error { return nil }
+
+            type Store struct {
+            	*Base
+            	sync.Mutex
+            	Name string
+            }
+
+            func (s *Store) Close() error { return nil }
+
+            func Use(s *Store, rc ReadCloser, c Closer) {
+            	s.Read()
+            	s.Lock()
+            	s.Base.Close()
+            	rc.Read()
+            	c.Close()
+            }
+        """,
+    })
+    inherits = set(db.execute("SELECT src_id, dst_id, confidence FROM edges WHERE kind = 'INHERITS'"))
+    # Embedded types are bases; type sets aren't.
+    assert {(src, dst) for src, dst, c in inherits if c == "exact"} == {
+        ("store/store.go::Store", "store/store.go::Base"),
+        ("store/store.go::ReadCloser", "store/store.go::Reader"),
+        ("store/store.go::ReadCloser", "store/store.go::Closer"),
+    }
+    # Types implement interfaces with promoted methods, and interfaces with embedded ones.
+    implements = {(src, dst) for src, dst, c in inherits if c == "inferred"}
+    assert ("store/store.go::Store", "store/store.go::ReadCloser") in implements
+    assert ("store/store.go::Base", "store/store.go::ReadCloser") in implements
+    # Shadowing an embedded type's method isn't overriding it; implementing an interface's is.
+    assert ("store/store.go::Store.Close", "store/store.go::Base.Close") not in edges(db, "OVERRIDES")
+    assert ("store/store.go::Store.Close", "store/store.go::Closer.Close") in edges(db, "OVERRIDES")
+    assert edges_from(db, "store/store.go::Use", "CALLS") == {
+        ("store/store.go::Base.Read", "inferred"),    # promoted, and through ReadCloser
+        ("store/store.go::Base.Close", "inferred"),   # through the embedded field, and through Closer
+        ("store/store.go::Reader.Read", "inferred"),
+        ("store/store.go::Closer.Close", "inferred"),
+        ("store/store.go::Store.Close", "inferred"),  # through Closer
+    }
+
+
+def test_jsdoc_types_javascript(tmp_path):
+    db = build(tmp_path, {
+        "store.js": """
+            export class Store {
+              add() {}
+            }
+            /** @returns {Store} */
+            export function makeStore() { return new Store(); }
+        """,
+        "app.js": """
+            import { Store, makeStore } from "./store.js";
+
+            /**
+             * Fills a store.
+             * @param {?Store} store - where to put them
+             * @param {Array<Store>} many
+             * @param {import("./cache.js").Cache} [cache]
+             * @returns {Promise<Store | null>}
+             */
+            export async function fill(store, many, cache) {
+              store.add();
+              cache.flush();
+              makeStore().add();
+              return store;
+            }
+
+            /** @type {Store} */
+            export const shared = makeStore();
+
+            export class Holder {
+              constructor() {
+                /** @type {Store} */
+                this.store = makeStore();
+              }
+              run() {
+                this.store.add();
+                shared.add();
+              }
+            }
+        """,
+        "cache.js": "export class Cache { flush() {} }\n",
+    })
+    assert edges_from(db, "app.js::fill", "CALLS") == {
+        ("store.js::Store.add", "inferred"),   # a parameter, and what a function returns
+        ("cache.js::Cache.flush", "inferred"), # imported in the type
+        ("store.js::makeStore", "exact"),
+    }
+    assert edges_from(db, "app.js::Holder.run", "CALLS") == {("store.js::Store.add", "inferred")}
+    assert edges_from(db, "app.js::fill", "USES") == {("store.js::Store", "exact"), ("cache.js::Cache", "exact")}
+    assert edges_from(db, "app.js::shared", "USES") == {("store.js::Store", "exact")}
+    assert ("app.js", "cache.js") in edges(db, "IMPORTS")
+    assert symbols(db)["app.js::fill"][2] == "Fills a store."
 
 
 # Values and components.
