@@ -30,6 +30,10 @@ tool in this context (unlike the orchestrator's own agent loop).
   its tools should be relative to that mount, not this host checkout.
   After starting commands, use tool "drop_command" to clean up after done
   with any shell job.
+- `automanic-analyze-graph` parses source trees into a sqlite code graph
+  inside the `analyze` container, which shares the same `/working` mount
+  as `shell` — pass `path_to_analyze` and `path_to_storage` as paths under
+  that mount, not this host checkout.
 - `automanic-feedback-discord` posts to and reads from the configured
   Discord channel; `SECRET_KEY`/`DISCORD_BOT_KEY` and friends come from
   [.env](.env), which is not for source control.

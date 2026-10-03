@@ -39,7 +39,11 @@ services:
     ports:
       - "7002:8000"
     volumes:
-      - ./working:/working
+      - type: bind
+        source: ./working
+        target: /working
+        bind:
+          create_host_path: true
 
   analyze:
     build:
