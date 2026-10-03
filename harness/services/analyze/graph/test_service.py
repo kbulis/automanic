@@ -176,7 +176,8 @@ def test_commonjs_exports_and_requires_resolve(tmp_path):
     assert {"store.js::Store", "api.js::load", "api.js::api", "api.js::api.save", "util.js::slug", "util.js::trim",
             "util.js::pad", "factory.js::factory"} <= exported
     assert not {"api.js::_hidden", "util.js::inner"} & exported
-    # Hidden files' exports are named without their dot, which would read as qualifying them.
+    # Hidden files' exports are named without their dot, which would read as
+    # qualifying them.
     assert {".eslintrc.js::eslintrc", ".eslintrc.js::eslintrc.env"} <= exported
 
 
@@ -349,7 +350,8 @@ def test_python_project_roots_resolve(tmp_path):
         """,
     })
     assert edges_from(db, "services/api/app/main.py::handler", "CALLS") == {("services/api/app/models.py::User", "exact")}
-    # A package's own directory isn't searched: `import subprocess` in it is python's.
+    # A package's own directory isn't searched: `import subprocess` in it is
+    # python's.
     assert {dst for src, dst in edges(db, "IMPORTS") if src == "services/api/app/main.py"} == {"services/api/app/models.py"}
     assert edges_from(db, "services/api/tests/test_models.py::test_user", "CALLS") == {
         ("services/api/app/models.py::User", "exact"),
@@ -372,7 +374,8 @@ def test_python_distributions_resolve_from_anywhere(tmp_path):
         # Poetry's include from a directory.
         "libs/poet/pyproject.toml": "[tool.poetry]\nname = 'poet'\npackages = [{ include = 'poet', from = 'lib' }]\n",
         "libs/poet/lib/poet/__init__.py": "def verse(): ...\n",
-        # setup.cfg's package_dir, and setup.py's find_packages, with modules too.
+        # setup.cfg's package_dir, and setup.py's find_packages, with modules
+        # too.
         "libs/cfg/setup.cfg": "[options]\npackage_dir =\n    =code\n",
         "libs/cfg/code/cfgpkg/__init__.py": "def load(): ...\n",
         "libs/old/setup.py": "from setuptools import setup, find_packages\nsetup(packages=find_packages('lib'))\n",
@@ -521,7 +524,8 @@ def test_file_docs_of_ts_js_and_go(tmp_path):
     found = symbols(db)
     assert found["serve.js"][2] == "Serves files from a directory."
     assert found["serve.js::serve"][2] == "Starts serving."
-    # A comment right above the first code documents that code, unless it says it's the file's.
+    # A comment right above the first code documents that code, unless it says
+    # it's the file's.
     assert found["attached.ts"][2] is None and found["attached.ts::load"][2] == "Loads the config."
     assert found["overview.ts"][2] == "Shared helpers for dates."
     assert found["env.d.ts"][2] is None
@@ -610,7 +614,8 @@ def test_decorator_arguments_are_the_decorated_symbols(tmp_path):
         """,
     })
     assert edges_from(db, "cases.py::test_cases", "REFERENCES") == {("cases.py::CASES", "exact"), ("cases.py::ids", "exact")}
-    # In the scope around the definition, not its own, whose parameter `check` is another.
+    # In the scope around the definition, not its own, whose parameter `check`
+    # is another.
     assert edges_from(db, "cases.py::Model.name", "REFERENCES") == {("cases.py::check", "exact")}
     assert edges_from(db, "users.module.ts::UsersModule", "REFERENCES") == {
         ("users.module.ts::UsersController", "exact"), ("users.module.ts::UsersService", "exact"),
@@ -715,7 +720,8 @@ def test_python_bindings_resolve_exactly(tmp_path):
         ("pkg/models/user.py::User", "exact"),
         ("pkg/models/role.py::Role", "exact"),
     }
-    # `json.dumps` is bound to a module outside the tree, so it doesn't guess the local dumps.
+    # `json.dumps` is bound to a module outside the tree, so it doesn't guess
+    # the local dumps.
     assert ("pkg/util.py::dumps", "guess") not in edges_from(db, "pkg/app.py::run", "CALLS")
 
 
@@ -993,7 +999,8 @@ def test_get_file_outlines_symbols_and_imports(tmp_path):
     assert outline[0]["doc"] == "Holds items."
     assert [s["name"] for s in outline[0]["members"]] == ["items", "add"]
 
-    # Cut short, the most referenced stay, counting their members' references, in the file's order.
+    # Cut short, the most referenced stay, counting their members' references,
+    # in the file's order.
     found = service.get_file(storage, "src/store.ts", max_symbols=2)
     assert found["truncated"] and [s["name"] for s in found["outline"]] == ["Store", "make"]
     assert "members" not in found["outline"][0]
@@ -1047,7 +1054,8 @@ def test_get_context_relates_symbols(tmp_path):
     add = service.get_context(storage, "store.py::Store.add", include_source=True, max_source_lines=2)
     assert [(c["id"], c["lines"]) for c in add["callees"] if c["id"] == "store.py::helper"] == [("store.py::helper", [7, 8])]
     assert [u["id"] for u in add["uses"]] == ["store.py::Item"]
-    # `anything.add(1)` is on an unknown object, and `add` is a method of python's own sets, so not guessed.
+    # `anything.add(1)` is on an unknown object, and `add` is a method of
+    # python's own sets, so not guessed.
     assert add["callers"] == []
     assert add["source"] == "    def add(self, item: Item) -> None:\n        helper()"
     assert add["source_truncated"] and add["counts"]["callees"] == len(add["callees"])
@@ -1283,8 +1291,9 @@ def test_python_infers_receivers(tmp_path):
         ("models.py::Store", "exact"),            # constructed
     }
     assert edges_from(db, "models.py::Fast.flush", "CALLS") == {("models.py::Cache.flush", "inferred")}
-    # Through an attribute of a class in another file; a type from outside the tree has no edge,
-    # and calls on unknown objects don't guess plain functions.
+    # Through an attribute of a class in another file; a type from outside the
+    # tree has no edge, and calls on unknown objects don't guess plain
+    # functions.
     assert edges_from(db, "app.py::run", "CALLS") == {("models.py::Store.add", "inferred")}
 
 
@@ -1488,13 +1497,16 @@ def test_guesses_stay_within_reach(tmp_path):
             function hydrate() {}
         """,
     })
-    # A method reachable through imports, `Store.holds` via lib.ts, is still guessed; a unique name in a
-    # file nothing imports, a test helper, another language's names, or `has` of js's own maps aren't.
+    # A method reachable through imports, `Store.holds` via lib.ts, is still
+    # guessed; a unique name in a file nothing imports, a test helper, another
+    # language's names, or `has` of js's own maps aren't.
     assert edges_from(db, "web/app.ts::run", "CALLS") == {("web/lib.ts::make", "exact"), ("web/store.ts::Store.holds", "guess")}
     assert edges_from(db, "tools/count.py::total", "CALLS") == set()
-    # An attribute typed from outside the tree isn't guessed against the file's own methods.
+    # An attribute typed from outside the tree isn't guessed against the file's
+    # own methods.
     assert edges_from(db, "web/health.ts::HealthController.check", "CALLS") == set()
-    # Nested functions resolve exactly, ahead of the file's own of the same name.
+    # Nested functions resolve exactly, ahead of the file's own of the same
+    # name.
     assert edges_from(db, "web/provider.tsx::Provider.load", "CALLS") == {("web/provider.tsx::Provider.hydrate", "exact")}
     assert edges_from(db, "web/provider.tsx::Provider", "CALLS") == {("web/provider.tsx::Provider.load", "exact")}
 
@@ -1552,7 +1564,8 @@ def test_python_overrides_and_dispatch(tmp_path):
         ("shapes.py::Cube.area", "shapes.py::Square.area"),
         ("shapes.py::Circle.area", "shapes.py::Shape.area"),
     }
-    # A call through a type may run its subtypes' overrides, but not its siblings'.
+    # A call through a type may run its subtypes' overrides, but not its
+    # siblings'.
     assert edges_from(db, "app.py::total", "CALLS") == {
         ("shapes.py::Shape.area", "inferred"),
         ("shapes.py::Square.area", "inferred"),
@@ -1660,11 +1673,13 @@ def test_python_protocols_are_implemented_structurally(tmp_path):
         """,
     })
     inherits = set(db.execute("SELECT src_id, dst_id, confidence FROM edges WHERE kind = 'INHERITS'"))
-    # Having all its methods, its own or its bases', implements it; subclassing it is declaring it.
+    # Having all its methods, its own or its bases', implements it; subclassing
+    # it is declaring it.
     assert ("saving.py::Disk", "saving.py::Saver", "inferred") in inherits
     assert ("saving.py::Declared", "saving.py::Saver", "exact") in inherits
     assert not {(src, dst) for src, dst, _ in inherits if src == "saving.py::Partial"}
-    # Not by dunders alone, which say nothing without signatures, nor where nothing reaches both.
+    # Not by dunders alone, which say nothing without signatures, nor where
+    # nothing reaches both.
     assert not {(src, dst) for src, dst, _ in inherits if src in ("saving.py::Handler", "elsewhere.py::Unrelated")}
     assert set(db.execute("SELECT src_id, dst_id, confidence FROM edges WHERE kind = 'OVERRIDES'")) == {
         ("saving.py::Disk.save", "saving.py::Saver.save", "inferred"),
@@ -1736,7 +1751,8 @@ def test_go_types_implement_interfaces(tmp_path):
     })
     found = symbols(db)
     assert found["store/store.go::Saver.Save"] == ("method", "Save(item string) error", "Save saves one.")
-    # Implementing is having all of an interface's methods, wherever in the package they're declared.
+    # Implementing is having all of an interface's methods, wherever in the
+    # package they're declared.
     assert set(db.execute("SELECT src_id, dst_id, confidence FROM edges WHERE kind = 'INHERITS'")) == {
         ("store/store.go::Disk", "store/store.go::Saver", "inferred"),
     }
@@ -1772,11 +1788,13 @@ def test_local_names_shadow_bare_calls(tmp_path):
                 onexc(1)
         """,
     })
-    # Aliases of the file's names and `global` names are the file's; parameters and loop variables aren't.
+    # Aliases of the file's names and `global` names are the file's; parameters
+    # and loop variables aren't.
     assert edges_from(db, "copy.py::walk", "CALLS") == {("copy.py::deepcopy", "exact")}
     assert edges_from(db, "copy.py::init", "CALLS") == {("copy.py::log", "exact")}
     assert edges_from(db, "copy.py::local", "CALLS") == set()
-    # A function defined in one is its symbol, though a parameter has its name too.
+    # A function defined in one is its symbol, though a parameter has its name
+    # too.
     assert edges_from(db, "copy.py::nested", "CALLS") == {("copy.py::nested.onexc", "exact")}
 
 
@@ -1825,11 +1843,13 @@ def test_go_embedding_promotes_and_implements(tmp_path):
         ("store/store.go::ReadCloser", "store/store.go::Reader"),
         ("store/store.go::ReadCloser", "store/store.go::Closer"),
     }
-    # Types implement interfaces with promoted methods, and interfaces with embedded ones.
+    # Types implement interfaces with promoted methods, and interfaces with
+    # embedded ones.
     implements = {(src, dst) for src, dst, c in inherits if c == "inferred"}
     assert ("store/store.go::Store", "store/store.go::ReadCloser") in implements
     assert ("store/store.go::Base", "store/store.go::ReadCloser") in implements
-    # Shadowing an embedded type's method isn't overriding it; implementing an interface's is.
+    # Shadowing an embedded type's method isn't overriding it; implementing an
+    # interface's is.
     assert ("store/store.go::Store.Close", "store/store.go::Base.Close") not in edges(db, "OVERRIDES")
     assert ("store/store.go::Store.Close", "store/store.go::Closer.Close") in edges(db, "OVERRIDES")
     assert edges_from(db, "store/store.go::Use", "CALLS") == {
@@ -1930,7 +1950,8 @@ def test_python_references_values(tmp_path):
                     register(self.handle)
         """,
     })
-    # Locals, like the `data` parameter over the file's `data`, and builtins aren't references.
+    # Locals, like the `data` parameter over the file's `data`, and builtins
+    # aren't references.
     assert edges_from(db, "app.py::run", "REFERENCES") == {
         ("lib.py::DEFAULT_LIMIT", "exact"),
         ("lib.py::handler", "exact"),
@@ -1998,7 +2019,8 @@ def test_callback_locals_stay_local(tmp_path):
             registerHooks({ resolve(specifier) { const parent = specifier; return parent; } });
         """,
     })
-    # Callback locals and object keys outside a namespace aren't symbols; parameters shadow the file's names.
+    # Callback locals and object keys outside a namespace aren't symbols;
+    # parameters shadow the file's names.
     assert set(symbols(db)) == {"store.test.ts", "store.test.ts::a", "store.test.ts::crop"}
     assert edges_from(db, "store.test.ts", "REFERENCES") == {("store.test.ts::crop", "exact")}
 
@@ -2227,7 +2249,8 @@ def test_go_packages_receivers_and_types(tmp_path):
     )
     assert found["internal/store/save.go::Store.save"][0] == "method"
 
-    # Imports resolve through go.mod to every file of the package; external modules have no edge.
+    # Imports resolve through go.mod to every file of the package; external
+    # modules have no edge.
     assert {dst for src, dst in edges(db, "IMPORTS") if src == "cmd/app/main.go"} == {
         "internal/store/store.go", "internal/store/save.go",
     }
