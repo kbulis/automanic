@@ -12,6 +12,7 @@ import requests
 import logging
 import discord
 import mcp.server.mcpserver
+import mcp.server.mcpserver.exceptions
 
 # Set up logging for service.
 
@@ -46,7 +47,7 @@ registry_url: str = os.environ.get("REGISTRY_URL", "")
 
 # Create the mcp server.
 
-mcp = mcp.server.mcpserver.MCPServer(service_name, log_level="WARNING")
+server = mcp.server.mcpserver.MCPServer(service_name, log_level="WARNING")
 
 class FeedbackSessionMap:
     """
@@ -142,49 +143,55 @@ class ToolPart(typing.TypedDict):
 class Message(typing.TypedDict):
     parts: list[TextPart | IdeaPart | FailPart | ToolPart]
 
+class ToolException(mcp.server.mcpserver.exceptions.ToolError):
+    pass
+
 @contextlib.contextmanager
 def api_error_wrapper():
+    # Raise tool-rrror, not runtime-error: the mcp server masks the text of any
+    # other exception, so the agent would never see these hints.
     try:
         yield
     except requests.exceptions.HTTPError as eX:
-        if eX.response:
+        # A Response is falsy for any 4xx/5xx status, so test for None.
+        if eX.response is not None:
             if eX.response.status_code == 400:
-                raise RuntimeError(
-                    "Server rejected the message. Check the markdown/content and message payload.",
+                raise ToolException(
+                    f"Server rejected the message ({eX.response.text[:512]}). Check the markdown/content and message payload.",
                 )
             if eX.response.status_code == 401:
-                raise RuntimeError(
+                raise ToolException(
                     "Bot token is invalid or expired. Do not retry with same credentials.",
                 )
             if eX.response.status_code == 403:
-                raise RuntimeError(
+                raise ToolException(
                     "Bot does not have permission to post in this channel. Do not retry with same credentials.",
                 )
             if eX.response.status_code == 404:
-                raise RuntimeError(
+                raise ToolException(
                     "Channel was not found or is inaccessible. Verify the channel configuration.",
                 )
             if eX.response.status_code == 429:
-                raise RuntimeError(
+                raise ToolException(
                     "Request was rate-limited. Wait before retrying.",
                 )
             if eX.response.status_code >= 500:
-                raise RuntimeError(
+                raise ToolException(
                     f"Server returned http {eX.response.status_code}. Do not retry.",
                 )
-        raise RuntimeError(
+        raise ToolException(
             f"Server returned unexpected error.",
         )
     except requests.exceptions.Timeout:
-        raise RuntimeError(
+        raise ToolException(
             f"Failed to respond within allotted time. Wait before retrying.",
         )
     except requests.exceptions.RequestException:
-        raise RuntimeError(
+        raise ToolException(
             "Failed to communicate with server. Check network connectivity and try again.",
         )
 
-@mcp.tool()
+@server.tool()
 def post_to_channel(session_id: str, message: Message) -> ChannelPostResult:
     """
     Post a message of markdown parts to the configured Discord channel to
@@ -193,7 +200,8 @@ def post_to_channel(session_id: str, message: Message) -> ChannelPostResult:
     Args:
         session_id: Durable context correlation id for linking feedback.
         message: Envelope {parts: [...]} wrapping an ordered list of parts
-            assembled into a single posted message, each rendered according
+            assembled into a single message, split across consecutive posts
+            if over discord's character limit, each part rendered according
             to its type:
                 {type: "text", text: str}: plain markdown, shown as-is
                 {type: "idea", text: str}: wrapped in italics
@@ -202,60 +210,71 @@ def post_to_channel(session_id: str, message: Message) -> ChannelPostResult:
                     name(params) call inside a code block
             The message may contain a notification, question, context, and
             response options. Keep the complete interaction prompt within
-            this single list of parts. Limit combined text body length to
-            1024 characters.
+            this single list of parts. Keep each part's text (or a tool
+            part's rendered params) to around 1024 characters; split longer
+            content across several parts.
 
     Returns:
-        The message_id of the posted message with the target channel_id;
-        together to be used as a correlation key for subsequent feedback
-        from a user communicating in the configured channel.
-        On exception, error reason will be raised as runtime error.
+        The message_id of the posted message (the last post, if split) with
+        the target channel_id; together to be used as a correlation key for
+        subsequent feedback from a user communicating in the configured
+        channel.
+        On exception, error reason will be raised as a tool error.
     """
 
     timeout_seconds = 15
 
-    body = "..."
+    # Discord rejects message content longer than 2000 characters with a 400,
+    # so pack whole parts into chunks, starting a new chunk whenever the next
+    # part would overflow, and post each chunk as its own message.
+    chunks = [f"🤖 **{robot_name}**:"]
 
-    if message.get("parts"):
-        body = ""
-        for part in message["parts"]:
-            if part["type"] == "tool":
-                content = f"```\n{part['name']}\n{json.dumps(part.get('params', {}), indent=2)}\n```"
-            else:
-                content = part.get("text").strip() if part.get("text") else ""
-                if part["type"] == "idea":
-                    content = "\n".join(f"> {line}" for line in f"*{content}*".split("\n"))
-                if part["type"] == "fail":
-                    content = f"> 🌋 {content}"
-            body += ("\n\n" if body else "") + content
+    for part in message.get("parts") or [{"type": "text", "text": "..."}]:
+        if part["type"] == "tool":
+            content = f"```\n{part['name']}\n{json.dumps(part.get('params', {}), indent=2)}\n```"
+        else:
+            content = part.get("text").strip() if part.get("text") else ""
+            if part["type"] == "idea":
+                content = "\n".join(f"> {line}" for line in f"*{content}*".split("\n"))
+            if part["type"] == "fail":
+                content = f"> 🌋 {content}"
+        if not content:
+            continue
+        if len(chunks[-1]) + len("\n\n") + len(content) > 2000:
+            chunks.append(content)
+        else:
+            chunks[-1] += "\n\n" + content
+
+    message_id = ""
 
     with api_error_wrapper():
-        response = requests.post(
-            url=f"https://discord.com/api/v10/channels/{channel_id}/messages",
-            headers={
-                "Authorization": f"Bot {secret_key}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "content": f"🤖 **{robot_name}**:\n\n{body}\n",
-            },
-            timeout=timeout_seconds,
-        )
+        for chunk in chunks:
+            response = requests.post(
+                url=f"https://discord.com/api/v10/channels/{channel_id}/messages",
+                headers={
+                    "Authorization": f"Bot {secret_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "content": chunk,
+                },
+                timeout=timeout_seconds,
+            )
 
-        response.raise_for_status()
-        result = response.json()
+            response.raise_for_status()
+            message_id = response.json()["id"]
 
-        mapping.set(
-            message_id=result["id"],
-            session_id=session_id
-        )
+            mapping.set(
+                message_id=message_id,
+                session_id=session_id
+            )
 
-        return {
-            "message_id": result["id"],
-            "channel_id": channel_id,
-        }
+    return {
+        "message_id": message_id,
+        "channel_id": channel_id,
+    }
 
-@mcp.tool()
+@server.tool()
 def mark_as_queuing(session_id: str, message_id: str):
     """
     React to a posted message with reaction to indicate the agent is
@@ -283,7 +302,7 @@ def mark_as_queuing(session_id: str, message_id: str):
         )
         response.raise_for_status()
 
-@mcp.tool()
+@server.tool()
 def mark_as_handled(session_id: str, message_id: str):
     """
     Remove the reaction previously added by mark_as_queuing, once a
@@ -312,7 +331,7 @@ def mark_as_handled(session_id: str, message_id: str):
         )
         response.raise_for_status()
 
-@mcp.tool()
+@server.tool()
 def ping() -> str:
     """
     Health check. Returns "ok" when the service is up; "down" when down.
@@ -371,7 +390,7 @@ if __name__ == "__main__":
     log.info(f". posting as '{robot_name}'")
 
     log.info(". available tools:")
-    for tool in mcp._tool_manager.list_tools():
+    for tool in server._tool_manager.list_tools():
         log.info(f". {tool.name}")
     gateway = threading.Thread(
         target=lambda: client.run(
@@ -395,7 +414,7 @@ if __name__ == "__main__":
     )
     tooling.start()
     try:
-        mcp.run(
+        server.run(
             transport="streamable-http",
             host="0.0.0.0",
             port=service_port,
