@@ -18,14 +18,15 @@ Supported languages: python, javascript, typescript (including jsx and tsx), and
 
 ## Configuration
 
-The service requires the following environment variables:
+The service reads the following environment variables:
 
 | Variable | Description |
 |---|---|
 | SERVICE_NAME | Optional: Registration name for this service |
 | SERVICE_ROLE | Optional: Registration role for this service (e.g. analyze, repository, etc.) |
-| ENDPOINT_URL | Self-stated url for discovering and invoking service tools |
 | REGISTRY_URL | Endpoint of registry for agent tool discovery |
+| ENDPOINT_URL | Self-stated url for discovering and invoking service tools |
+| DIRECTION_MD | Optional override of the bundled agent policy markdown direction.md; replaces it entirely |
 | PORT         | Optional override, default = 8000 |
 | LOG_LEVEL    | Optional override, default = INFO |
 

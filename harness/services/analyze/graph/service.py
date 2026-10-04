@@ -7,15 +7,15 @@ import time
 import threading
 import textwrap
 import requests
-import logging
 import json
 import tomllib
-import configparser
-import hashlib
-import pathlib
 import dataclasses
 import contextlib
 import faulthandler
+import configparser
+import hashlib
+import pathlib
+import logging
 import sqlite3
 import tree_sitter
 import tree_sitter_python
@@ -54,6 +54,7 @@ service_role: str = os.environ.get("SERVICE_ROLE", "analyze")
 service_port: int = int(os.environ.get("PORT", "8000"))
 endpoint_url: str = os.environ.get("ENDPOINT_URL", "")
 registry_url: str = os.environ.get("REGISTRY_URL", "")
+direction_md: str = os.environ.get("DIRECTION_MD") or pathlib.Path(__file__).with_name("direction.md").read_text(encoding="utf-8")
 
 # Create the mcp server.
 
@@ -3707,7 +3708,7 @@ def ping() -> str:
 
     return "ok"
 
-def add_to_registry(name: str, role: str, endpoint: str, url: str, port: int):
+def add_to_registry(name: str, role: str, direction: str, endpoint: str, url: str, port: int):
     deadline = time.monotonic() + 30
 
     while time.monotonic() < deadline:
@@ -3727,6 +3728,7 @@ def add_to_registry(name: str, role: str, endpoint: str, url: str, port: int):
             json={
                 "name": name,
                 "role": role,
+                "direction": direction,
                 "endpoint": endpoint,
             },
             timeout=15,
@@ -3763,6 +3765,7 @@ if __name__ == "__main__":
         target=lambda: add_to_registry(
             name=service_name,
             role=service_role,
+            direction=direction_md,
             endpoint=endpoint_url,
             url=registry_url,
             port=service_port,

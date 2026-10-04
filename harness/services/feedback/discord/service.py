@@ -3,12 +3,14 @@ import os
 import sys
 import time
 import json
+import re
 import urllib.parse
 import asyncio
 import threading
 import contextlib
 import textwrap
 import requests
+import pathlib
 import logging
 import discord
 import mcp.server.mcpserver
@@ -44,6 +46,7 @@ robot_name: str = os.environ.get("ROBOT_NAME", "unknown")
 endpoint_url: str = os.environ.get("ENDPOINT_URL", "")
 messages_url: str = os.environ.get("MESSAGES_URL", "")
 registry_url: str = os.environ.get("REGISTRY_URL", "")
+direction_md: str = os.environ.get("DIRECTION_MD") or pathlib.Path(__file__).with_name("direction.md").read_text(encoding="utf-8")
 
 # Create the mcp server.
 
@@ -224,23 +227,45 @@ def post_to_channel(session_id: str, message: Message) -> ChannelPostResult:
 
     timeout_seconds = 15
 
-    # Discord rejects message content longer than 2000 characters with a 400,
-    # so pack whole parts into chunks, starting a new chunk whenever the next
-    # part would overflow, and post each chunk as its own message.
-    chunks = [f"🤖 **{robot_name}**:"]
+    limit = 2000
+
+    def render(kind: str, text: str) -> str:
+        if kind == "tool":
+            return f"```\n{text}\n```"
+        if kind == "idea":
+            return "\n".join(f"> {line}" for line in f"*{text}*".split("\n"))
+        if kind == "fail":
+            return f"> 🌋 {text}"
+        return text
+
+    sends: list[str] = []
 
     for part in message.get("parts") or [{"type": "text", "text": "..."}]:
-        if part["type"] == "tool":
-            content = f"```\n{part['name']}\n{json.dumps(part.get('params', {}), indent=2)}\n```"
+        kind = part["type"]
+        if kind == "tool":
+            text = f"{part['name']}\n{json.dumps(part.get('params', {}), indent=2)}"
         else:
-            content = part.get("text").strip() if part.get("text") else ""
-            if part["type"] == "idea":
-                content = "\n".join(f"> {line}" for line in f"*{content}*".split("\n"))
-            if part["type"] == "fail":
-                content = f"> 🌋 {content}"
-        if not content:
-            continue
-        if len(chunks[-1]) + len("\n\n") + len(content) > 2000:
+            text = part.get("text").strip() if part.get("text") else ""
+        tokens: list[str] = []
+        for line in text.splitlines(keepends=True):
+            if len(render(kind, line.rstrip())) <= limit:
+                tokens.append(line)
+                continue
+            for word in re.split(r"(?<= )", line):
+                tokens.extend(word[i:i + limit // 2] for i in range(0, len(word), limit // 2))
+        piece = ""
+        for token in tokens:
+            if piece.strip() and len(render(kind, (piece + token).rstrip())) > limit:
+                sends.append(render(kind, piece.rstrip()))
+                piece = ""
+            piece += token
+        if piece.strip():
+            sends.append(render(kind, piece.rstrip()))
+
+    chunks = [f"🤖 **{robot_name}**:"]
+
+    for content in sends:
+        if len(chunks[-1]) + len("\n\n") + len(content) > limit:
             chunks.append(content)
         else:
             chunks[-1] += "\n\n" + content
@@ -339,7 +364,7 @@ def ping() -> str:
 
     return "ok" if client.is_ready() else "down"
 
-def add_to_registry(name: str, role: str, endpoint: str, url: str, port: int):
+def add_to_registry(name: str, role: str, direction: str, endpoint: str, url: str, port: int):
     deadline = time.monotonic() + 30
 
     while time.monotonic() < deadline:
@@ -359,6 +384,7 @@ def add_to_registry(name: str, role: str, endpoint: str, url: str, port: int):
             json={
                 "name": name,
                 "role": role,
+                "direction": direction,
                 "endpoint": endpoint,
             },
             timeout=15,
@@ -405,6 +431,7 @@ if __name__ == "__main__":
         target=lambda: add_to_registry(
             name=service_name,
             role=service_role,
+            direction=direction_md,
             endpoint=endpoint_url,
             url=registry_url,
             port=service_port,

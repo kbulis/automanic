@@ -7,7 +7,6 @@ import contextlib
 import textwrap
 import datetime
 import dotenv
-import json
 import pydantic
 import mcp
 import mcp.client.streamable_http
@@ -40,7 +39,7 @@ log = logging.getLogger()
 # Initialize configuration.
 
 agent_api_key = os.getenv("AGENT_API_KEY")
-agent_model = os.getenv("AGENT_MODEL", "claude-opus-5")
+agent_model = os.getenv("AGENT_MODEL") or "claude-opus-5-5"
 
 class Agent:
     """
@@ -64,6 +63,7 @@ class Agent:
     class Service:
         name: str
         role: str
+        direction: str
         endpoint: str
         tools: list[anthropic.types.ToolParam]
 
@@ -128,7 +128,7 @@ class Agent:
                     },
                 )
 
-    def install_service(self, name: str, role: str, endpoint: str, tools: list[anthropic.types.ToolParam]):
+    def install_service(self, name: str, role: str, direction: str, endpoint: str, tools: list[anthropic.types.ToolParam]):
         """
         Called from a handler thread to register an active service of tools
         for use in subsequent agent interactions.
@@ -140,6 +140,7 @@ class Agent:
             self._toolbox[name] = self.Service(
                 name=name,
                 role=role,
+                direction=direction,
                 endpoint=endpoint,
                 tools=tools,
             )
@@ -208,25 +209,20 @@ class Agent:
         }]
 
         while True:
+            stop_now = False
             messages = []
-            tools: list[anthropic.types.ToolParam] = []
 
             with self._block:
                 if not self._queue and not self._done:
                     self._block.wait()
                 if not self._queue and self._done:
-                    await self._api.close()
-                    return
-                tools = [
-                    {
-                        **tool,
-                        "name": service.name + "-" + tool.get("name"),
-                    }
-                    for service in self._toolbox.values() for tool in service.tools
-                    if service.role != "feedback"
-                ]
+                    stop_now = True
                 messages = self._queue
                 self._queue = []
+
+            if stop_now:
+                await self._api.close()
+                return
 
             for message in messages:
                 context = self._context.setdefault(
@@ -256,30 +252,59 @@ class Agent:
                 looping = True
 
                 while looping:
-                    answers = []
+                    tooling: list[anthropic.types.ToolParam] = []
+                    runbook: list[str] = []
+
+                    with self._block:
+                        runbook = [
+                            service.direction.strip()
+                            for service in self._toolbox.values()
+                            if service.direction.strip() != "" and service.role != "feedback"
+                        ]
+                        tooling = [
+                            {
+                                **tool,
+                                "name": service.name + "-" + tool.get("name"),
+                            }
+                            for service in self._toolbox.values() for tool in service.tools
+                            if service.role != "feedback"
+                        ]
+
+                    answers: list[dict] = []
 
                     try:
                         response = await self._api.messages.create(
                             model=self.model,
                             max_tokens=8192,
-                            system=f"""
-                                You are a long-lived, general-purpose agent that can research,
-                                write code, run commands, and use connected tools to complete
-                                the user's task end to end. When you respond, brevity is very
-                                valuable; be brief and concise.
-                                When you check tools for connectivity and status, note that
-                                tooling will be logically grouped by prefix (tools prefixed
-                                the same should be considered a group). If a group has a ping
-                                tool, use that to assess status and connectivity.
-                                If you find that you need tools to accomplish a request, but
-                                are unable to identify one, use help-request_feature.
-                                Format agent responses as markdown (sans tables).
-                                """,
+                            system=[{
+                                "type": "text",
+                                "text": textwrap.dedent("""
+                                    You are a long-lived, general-purpose agent that can research,
+                                    write code, run commands, and use connected tools to complete
+                                    the user's task end to end. When you respond, brevity is very
+                                    valuable; be brief and concise.
+                                    When you check tools for connectivity and status, note that
+                                    tooling will be logically grouped by prefix (tools prefixed
+                                    the same should be considered a group). If a group has a ping
+                                    tool, use that to assess status and connectivity.
+                                    If you find that you need tools to accomplish a request, but
+                                    are unable to identify one, use help-request_feature.
+                                    Format agent responses as markdown (sans tables).
+
+                                    Orchestration policy playbook:
+                                """).strip()
+                                    + "\n\n"
+                                    + "\n\n".join(runbook),
+                                "cache_control": {
+                                    "type": "ephemeral",
+                                    "ttl": "1h"
+                                },
+                            }],
                             thinking={
                                 "type": "adaptive",
                                 "display": "summarized",
                             },
-                            tools=tools + helps,
+                            tools=tooling + helps,
                             messages=context.history,
                         )
 
@@ -414,6 +439,7 @@ app = fastapi.FastAPI(
 class ServiceDescriptor(pydantic.BaseModel):
     name: str
     role: str
+    direction: str
     endpoint: str
 
 @app.post("/registry")
@@ -431,6 +457,7 @@ async def register_mcp_service(request: fastapi.Request, body: ServiceDescriptor
                 agent.install_service(
                     name=body.name,
                     role=body.role,
+                    direction=body.direction,
                     endpoint=body.endpoint,
                     tools=[
                         {

@@ -12,7 +12,7 @@ MCP service for autonomous agents to request user feedback through Discord.
 
 ## Configuration
 
-The service requires the following environment variables:
+The service reads the following environment variables:
 
 | Variable | Description |
 |---|---|
@@ -21,10 +21,12 @@ The service requires the following environment variables:
 | SECRET_KEY   | Discord bot token used by the service |
 | CHANNEL_ID   | Discord channel id where feedback requests are communicated |
 | ROBOT_NAME   | Name used when posting feedback requests |
-| ENDPOINT_URL | Self-stated url for discovering and invoking service tools |
 | MESSAGES_URL | Endpoint of participating agent for posting feedback messages |
 | REGISTRY_URL | Endpoint of registry for agent tool discovery |
+| ENDPOINT_URL | Self-stated url for discovering and invoking service tools |
+| DIRECTION_MD | Optional override of the bundled agent policy markdown direction.md; replaces it entirely |
 | PORT         | Optional override, default = 8000 |
+| LOG_LEVEL    | Optional override, default = INFO |
 
 Note: SECRET_KEY contains a secret key. Do **not** commit your Discord bot key to source control.
 
@@ -61,7 +63,7 @@ services:
       - "7001:8000"
 ```
 
-And add an entry to you mcp servers (e.g., claude code's .mcp.json):
+And add an entry to your mcp servers (e.g., claude code's .mcp.json):
 
 ```json
 {

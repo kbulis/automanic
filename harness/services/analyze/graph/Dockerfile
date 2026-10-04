@@ -13,6 +13,7 @@ RUN pip install --quiet --no-cache-dir --root-user-action=ignore --upgrade pip &
     "tree-sitter-go==0.25.0" \
     "requests>=2,<3"
 
+COPY direction.md .
 COPY service.py .
 
 RUN useradd --create-home --shell /usr/sbin/nologin service && chown -R service:service /service

@@ -36,6 +36,7 @@ RUN pip install --no-cache-dir --root-user-action=ignore --upgrade pip && pip in
     "ruff" \
     "mypy"
 
+COPY direction.md .
 COPY service.py .
 
 RUN useradd --create-home --shell /usr/sbin/nologin service && chown -R service:service /service
