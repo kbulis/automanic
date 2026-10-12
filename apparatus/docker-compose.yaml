@@ -2,7 +2,7 @@ services:
 
   orchestrator:
     build:
-      context: ../harness/services/orchestrator/claude
+      context: ../harness/services/orchestrator/claudeapi
     environment:
       AGENT_API_KEY: ${ANTHROPIC_API_KEY:?ANTHROPIC_API_KEY is required}
       AGENT_MODEL: ${CLAUDE_MODEL:-}

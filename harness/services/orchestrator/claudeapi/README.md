@@ -1,11 +1,11 @@
-# Orchestrator Claude
+# Orchestrator ClaudeApi
 
 Orchestration server for managing autonomous agents and context. Uses
 anthropic api with managed context and tooling.
 
 ## What it does
 
-`orchestrator-claude` manages agent workflows as prompted through
+`orchestrator-claudeapi` manages agent workflows as prompted through
 feedback service message events.
 
 ## API
@@ -33,7 +33,7 @@ Note: AGENT_API_KEY is secret. Do **not** commit your anthropic api key to sourc
 Pull the latest release:
 
 ```bash
-docker pull automanic/orchestrator-claude:latest
+docker pull automanic/orchestrator-claudeapi:latest
 ```
 
 ## Docker Compose with agents
@@ -44,7 +44,7 @@ Add this service entry with your env variables mapped:
 services:
 
   orchestrator:
-    image: automanic/orchestrator-claude:latest
+    image: automanic/orchestrator-claudeapi:latest
     environment:
       AGENT_API_KEY: ${ANTHROPIC_API_KEY:?ANTHROPIC_API_KEY is required}
       AGENT_MODEL: ${CLAUDE_MODEL:-}

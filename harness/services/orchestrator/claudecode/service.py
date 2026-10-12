@@ -1,17 +1,17 @@
 import os
 import sys
+import uuid
+import json
 import asyncio
 import threading
 import dataclasses
 import contextlib
 import textwrap
-import datetime
 import dotenv
 import pydantic
 import mcp
 import mcp.client.streamable_http
 import fastapi
-import anthropic
 import uvicorn
 import logging
 
@@ -38,7 +38,7 @@ log = logging.getLogger()
 
 # Initialize configuration.
 
-agent_api_key = os.getenv("AGENT_API_KEY")
+agent_auth_token = os.getenv("AGENT_AUTH_TOKEN")
 agent_model = os.getenv("AGENT_MODEL") or "claude-opus-5-5"
 
 class Agent:
@@ -47,17 +47,16 @@ class Agent:
     """
 
     @dataclasses.dataclass
+    class ToolParam:
+        name: str
+        description: str
+        input_schema: dict[str, object]
+
+    @dataclasses.dataclass
     class QueuedMessage:
         session_id: str
         message_id: str
         content: str
-
-    @dataclasses.dataclass
-    class Context:
-        history: list[anthropic.types.MessageParam]
-        input_tokens: int
-        write_tokens: int
-        started_on: datetime.datetime
 
     @dataclasses.dataclass
     class Service:
@@ -65,11 +64,9 @@ class Agent:
         role: str
         direction: str
         endpoint: str
-        tools: list[anthropic.types.ToolParam]
+        tools: list["Agent.ToolParam"]
 
-    def __init__(self, agent_api_key: str, agent_model: str):
-        self._api = anthropic.AsyncAnthropic(api_key=agent_api_key)
-        self._context: dict[str, Agent.Context] = {}
+    def __init__(self, agent_auth_token: str, agent_model: str):
         self._toolbox: dict[str, Agent.Service] = {}
         self._queue: list[Agent.QueuedMessage] = []
         self._block: threading.Condition = threading.Condition()
@@ -97,12 +94,12 @@ class Agent:
                 if not full_name and role and service.role != role:
                     continue
                 for tool in service.tools:
-                    if full_name and full_name == f"{service.name}-{tool.get('name')}":
-                        name = tool["name"]
+                    if full_name and full_name == f"{service.name}-{tool.name}":
+                        name = tool.name
                         url = service.endpoint
                         break
-                    if not full_name and role == service.role and tool_name == tool.get("name"):
-                        name = tool["name"]
+                    if not full_name and role == service.role and tool_name == tool.name:
+                        name = tool.name
                         url = service.endpoint
                         break
                 if name and url:
@@ -128,7 +125,7 @@ class Agent:
                     },
                 )
 
-    def install_service(self, name: str, role: str, direction: str, endpoint: str, tools: list[anthropic.types.ToolParam]):
+    def install_service(self, name: str, role: str, direction: str, endpoint: str, tools: list[ToolParam]):
         """
         Called from a handler thread to register an active service of tools
         for use in subsequent agent interactions.
@@ -173,15 +170,17 @@ class Agent:
         been called. Drains and processes whatever is queued each pass,
         then exits once stopping and the queue is empty.
         """
-        
-        helps: list[anthropic.types.ToolParam] = [{
-            "name": "help-request_feature",
-            "description": """
+
+        session_id = str(uuid.uuid4())
+
+        helping: list[Agent.ToolParam] = [Agent.ToolParam(
+            name="help-request_feature",
+            description="""
                 When encountering the need for a tool interaction that seems
                 unavailable, use this tool to request the feature with a very
                 brief description of what you would like to accomplish and why.
             """,
-            "input_schema": {
+            input_schema={
                 "type": "object",
                 "properties": {
                     "what": {
@@ -196,17 +195,80 @@ class Agent:
                     "why",
                 ]
             },
-        }, {
-            "name": "help-ping",
-            "description": """
+        ), Agent.ToolParam(
+            name="help-ping",
+            description="""
                 Health check. Returns "ok" when the service is up.
             """,
-            "input_schema": {
+            input_schema={
                 "type": "object",
                 "properties": {
                 },
             },
-        }]
+        )]
+
+        def write_system_configuration():
+            toolbox: list[Agent.Service] = []
+
+            with self._block:
+                toolbox = [
+                    service
+                    for service in self._toolbox.values()
+                    if service.role != "feedback"
+                ]
+
+            with open(os.path.join(os.getcwd(), "CLAUDE.md"), "w", encoding="utf-8") as file:
+                file.write(
+                    textwrap.dedent("""
+                        You are a long-lived, general-purpose agent that can research,
+                        write code, run commands, and use connected tools to complete
+                        the user's task end to end. When you respond, brevity is very
+                        valuable; be brief and concise.
+                        When you check tools for connectivity and status, note that
+                        tooling will be logically grouped by prefix (tools prefixed
+                        the same should be considered a group). If a group has a ping
+                        tool, use that to assess status and connectivity.
+                        If you find that you need tools to accomplish a request, but
+                        are unable to identify one, use help-request_feature.
+                        Format agent responses as markdown (sans tables).
+
+                        Orchestration policy playbook:
+                    """).strip()
+                        + "\n\n"
+                        + "\n\n".join([service.direction.strip() for service in toolbox if service.direction.strip() != ""])
+                        + "\n"
+                )
+
+            with open(os.path.join(os.getcwd(), ".mcp.json"), "w", encoding="utf-8") as file:
+                json.dump({
+                    "mcpServers": {
+                        f"automanic-{service.name}": {
+                            "type": "http",
+                            "url": service.endpoint,
+                        }
+                        for service in toolbox
+                    },
+                }, file, indent=4)
+
+            with open(os.path.join(os.getcwd(), ".settings.json"), "w", encoding="utf-8") as file:
+                json.dump({
+                    "enableAllProjectMcpServers": True,
+                    "permissions": {
+                        "allow": [
+                            f"mcp__automanic-{service.name}__{tool.name}"
+                            for service in toolbox for tool in service.tools
+                        ],
+                    },
+                }, file, indent=4)
+
+        try:
+            write_system_configuration()
+        except Exception:
+            log.exception("! write system configuration failed")
+
+        # BUGBUG need to invoke self._cli like _api but to call with --session-id
+        # because starting new session... prompt to check services, but only after
+        # saving system prompt and complete tooling + helping
 
         while True:
             stop_now = False
@@ -221,25 +283,9 @@ class Agent:
                 self._queue = []
 
             if stop_now:
-                await self._api.close()
                 return
 
             for message in messages:
-                context = self._context.setdefault(
-                    message.session_id,
-                    self.Context(
-                        history=[],
-                        input_tokens=0,
-                        write_tokens=0,
-                        started_on=datetime.datetime.now(),
-                    ),
-                )
-
-                context.history.append({
-                    "role": "user",
-                    "content": message.content,
-                })
-
                 await self._post_to_tool(
                     tool_name="mark_as_queuing",
                     role="feedback",
@@ -252,68 +298,14 @@ class Agent:
                 looping = True
 
                 while looping:
-                    tooling: list[anthropic.types.ToolParam] = []
-                    runbook: list[str] = []
-
-                    with self._block:
-                        runbook = [
-                            service.direction.strip()
-                            for service in self._toolbox.values()
-                            if service.direction.strip() != "" and service.role != "feedback"
-                        ]
-                        tooling = [
-                            {
-                                **tool,
-                                "name": service.name + "-" + tool.get("name"),
-                            }
-                            for service in self._toolbox.values() for tool in service.tools
-                            if service.role != "feedback"
-                        ]
-
                     answers: list[dict] = []
 
                     try:
-                        response = await self._api.messages.create(
-                            model=self.model,
-                            max_tokens=8192,
-                            system=[{
-                                "type": "text",
-                                "text": textwrap.dedent("""
-                                    You are a long-lived, general-purpose agent that can research,
-                                    write code, run commands, and use connected tools to complete
-                                    the user's task end to end. When you respond, brevity is very
-                                    valuable; be brief and concise.
-                                    When you check tools for connectivity and status, note that
-                                    tooling will be logically grouped by prefix (tools prefixed
-                                    the same should be considered a group). If a group has a ping
-                                    tool, use that to assess status and connectivity.
-                                    If you find that you need tools to accomplish a request, but
-                                    are unable to identify one, use help-request_feature.
-                                    Format agent responses as markdown (sans tables).
-
-                                    Orchestration policy playbook:
-                                """).strip()
-                                    + "\n\n"
-                                    + "\n\n".join(runbook),
-                                "cache_control": {
-                                    "type": "ephemeral",
-                                    "ttl": "1h"
-                                },
-                            }],
-                            thinking={
-                                "type": "adaptive",
-                                "display": "summarized",
-                            },
-                            tools=tooling + helps,
-                            messages=context.history,
-                        )
-
-                        context.write_tokens += response.usage.output_tokens
-                        context.input_tokens += response.usage.input_tokens
+                        response = { "content": [], "stop_reason": ""} # BUGBUG invoke claude code as process and stream stdout and stderror
 
                         results = []
 
-                        for block in response.content:
+                        for block in response.get("content", []):
                             if block.type == "tool_use":
                                 if not block.name.startswith("help-"):
                                     result = await self._post_to_tool(
@@ -352,28 +344,14 @@ class Agent:
                                     "text": block.text,
                                 })
 
-                        if response.stop_reason == "end_turn":
+                        if response.get("stop_reason", "") == "end_turn":
                             looping = False
 
-                        context.history.append({
-                            "role": response.role,
-                            "content": response.content,
-                        })
-
-                        if results:
-                            context.history.append({
-                                "role": "user",
-                                "content": results,
-                            })
-                        else:
+                        if not results:
                             looping = False
 
-                    except anthropic.APIError as eX:
-                        error_message = eX.message
-                        if isinstance(eX.body, dict):
-                            error = eX.body.get("error")
-                            if isinstance(error, dict) and error.get("message"):
-                                error_message = error["message"]
+                    except Exception as eX: # BUGBUG need claude call specific erroring
+                        error_message = str(eX) # BUGBUG pull out actual error messaging for user to see
                         answers.append({
                             "type": "fail",
                             "text": error_message,
@@ -389,7 +367,7 @@ class Agent:
                                 "message": {
                                     "parts": answers + [{
                                         "type": "idea",
-                                        "text": f"(total = {context.input_tokens}/{context.write_tokens}, depth = {len(context.history)})"
+                                        "text": f"(total = ...)", # BUGBUG include stats on token usage for calls
                                     }],
                                 },
                             },
@@ -408,10 +386,10 @@ class Agent:
 async def lifespan(app: fastapi.FastAPI):
     log.info(". orchestrator spinning up...")
 
-    if not agent_api_key:
-        raise RuntimeError("agent api key is not set")
+    if not agent_auth_token:
+        raise RuntimeError("agent auth token is not set")
 
-    app.state.agent = Agent(agent_api_key, agent_model)
+    app.state.agent = Agent(agent_auth_token=agent_auth_token, agent_model=agent_model)
 
     worker = threading.Thread(
         target=lambda: asyncio.run(app.state.agent.run()),
@@ -460,11 +438,11 @@ async def register_mcp_service(request: fastapi.Request, body: ServiceDescriptor
                     direction=body.direction,
                     endpoint=body.endpoint,
                     tools=[
-                        {
-                            "name": tool.name,
-                            "description": tool.description or "",
-                            "input_schema": tool.input_schema,
-                        }
+                        Agent.ToolParam(
+                            name=tool.name,
+                            description=tool.description or "",
+                            input_schema=tool.input_schema,
+                        )
                         for tool in (await service.list_tools()).tools
                     ],
                 )
@@ -517,11 +495,11 @@ async def health():
 
 if __name__ == "__main__":
     print(textwrap.dedent(r"""
-    .                                           /                                                 _               
-    .           _/_                      o     /          /         _/_         _/_              //            /  
-    .  __,  , , /  __ _ _ _   __,  _ _  ,  _, /__ _   _, /_  _  (   /  _   __,  /  __ _      _, // __,  , , __/ _ 
-    . (_/(_(_/_(__(_)/ / / /_(_/(_/ / /_(_(__/(_)/ (_(__/ /_(/_/_)_(__/ (_(_/(_(__(_)/ (_---(__(/_(_/(_(_/_(_/_(/_
-    .                                                                                                             
+    .                                           /                                                 _                            
+    .           _/_                      o     /          /         _/_         _/_              //            /            /  
+    .  __,  , , /  __ _ _ _   __,  _ _  ,  _, /__ _   _, /_  _  (   /  _   __,  /  __ _      _, // __,  , , __/ _  _, __ __/ _ 
+    . (_/(_(_/_(__(_)/ / / /_(_/(_/ / /_(_(__/(_)/ (_(__/ /_(/_/_)_(__/ (_(_/(_(__(_)/ (_---(__(/_(_/(_(_/_(_/_(/_(__(_)(_/_(/_
+    .                                                                                                                          
     . 
     . 
     . powered by automanic 🍣
