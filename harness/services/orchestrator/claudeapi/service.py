@@ -193,7 +193,7 @@ class Agent:
                     },
                 )
 
-    async def _invoke_api(self, system: SystemParam, tools: list[ToolParam], messages: list[anthropic.types.MessageParam]) -> Response:
+    async def _invoke_agent(self, system: SystemParam, tools: list[ToolParam], messages: list[anthropic.types.MessageParam]) -> Response:
         """
         Convert the given system and tools for the api, send the history, and
         wrap the reply in a response. Raises agent exception carrying the api's
@@ -385,7 +385,7 @@ class Agent:
                     answers: list[dict] = []
 
                     try:
-                        response = await self._invoke_api(
+                        response = await self._invoke_agent(
                             system=Agent.SystemParam(
                                 text=textwrap.dedent("""
                                     You are a long-lived, general-purpose agent that can research,
