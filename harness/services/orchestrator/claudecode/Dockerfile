@@ -13,13 +13,13 @@ RUN pip install --quiet --no-cache-dir --root-user-action=ignore --upgrade pip &
     "fastapi>=0,<1" \
     "mcp>=2,<3"
 
-COPY service.py .
-
 RUN useradd --create-home --shell /usr/sbin/nologin service && chown -R service:service /service
 USER service
 
 ENV DISABLE_AUTOUPDATER=1
 
 EXPOSE 8000
+
+COPY service.py .
 
 ENTRYPOINT ["python", "service.py"]
