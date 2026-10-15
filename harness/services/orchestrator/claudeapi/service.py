@@ -1,3 +1,4 @@
+import typing
 import os
 import sys
 import asyncio
@@ -43,8 +44,14 @@ agent_model = os.getenv("AGENT_MODEL") or "claude-opus-5-5"
 
 class Agent:
     """
-    ...
+    Claude api agent that drains queued user messages on a worker thread,
+    keeping per-session history and calling registered mcp service tools
+    until each turn ends, posting progress back via the feedback service.
     """
+
+    @dataclasses.dataclass
+    class SystemParam:
+        text: str
 
     @dataclasses.dataclass
     class ToolParam:
@@ -65,6 +72,53 @@ class Agent:
         write_tokens: int
         started_on: datetime.datetime
 
+    @dataclasses.dataclass(kw_only=True)
+    class BaseBlock:
+        type: typing.Literal["tool_use", "thinking", "text"]
+
+    @dataclasses.dataclass(kw_only=True)
+    class ToolBlock(BaseBlock):
+        type: typing.Literal["tool_use"] = "tool_use"
+        id: str
+        name: str
+        input: dict[str, object]
+
+    @dataclasses.dataclass(kw_only=True)
+    class IdeaBlock(BaseBlock):
+        type: typing.Literal["thinking"] = "thinking"
+        thinking: str
+
+    @dataclasses.dataclass(kw_only=True)
+    class TextBlock(BaseBlock):
+        type: typing.Literal["text"] = "text"
+        text: str
+
+    @dataclasses.dataclass
+    class Response:
+        role: typing.Literal["assistant"]
+        content: list[anthropic.types.ContentBlock]
+        input_tokens: int
+        output_tokens: int
+        finished: bool
+
+        @property
+        def blocks(self) -> typing.Iterator["Agent.ToolBlock | Agent.IdeaBlock | Agent.TextBlock"]:
+            for block in self.content:
+                if block.type == "tool_use":
+                    yield Agent.ToolBlock(
+                        id=block.id,
+                        name=block.name,
+                        input=block.input,
+                    )
+                if block.type == "thinking":
+                    yield Agent.IdeaBlock(
+                        thinking=block.thinking,
+                    )
+                if block.type == "text":
+                    yield Agent.TextBlock(
+                        text=block.text,
+                    )
+
     @dataclasses.dataclass
     class Service:
         name: str
@@ -72,6 +126,11 @@ class Agent:
         direction: str
         endpoint: str
         tools: list["Agent.ToolParam"]
+
+    class AgentException(RuntimeError):
+        def __init__(self, message: str):
+            super().__init__(message)
+            self.message = message
 
     def __init__(self, agent_api_key: str, agent_model: str):
         self._api = anthropic.AsyncAnthropic(api_key=agent_api_key)
@@ -133,6 +192,52 @@ class Agent:
                         "session_id": session_id,
                     },
                 )
+
+    async def _invoke_api(self, system: SystemParam, tools: list[ToolParam], messages: list[anthropic.types.MessageParam]) -> Response:
+        """
+        Convert the given system and tools for the api, send the history, and
+        wrap the reply in a response. Raises agent exception carrying the api's
+        error message on failure.
+        """
+
+        try:
+            response = await self._api.messages.create(
+                model=self.model,
+                max_tokens=8192,
+                system=[{
+                    "type": "text",
+                    "text": system.text,
+                    "cache_control": {
+                        "type": "ephemeral",
+                        "ttl": "1h",
+                    },
+                }],
+                thinking={
+                    "type": "adaptive",
+                    "display": "summarized",
+                },
+                tools=[anthropic.types.ToolParam(
+                    name=tool.name,
+                    description=tool.description,
+                    input_schema=tool.input_schema,
+                ) for tool in tools],
+                messages=messages,
+            )
+        except anthropic.APIError as eX:
+            error_message = eX.message
+            if isinstance(eX.body, dict):
+                error = eX.body.get("error")
+                if isinstance(error, dict) and error.get("message"):
+                    error_message = error["message"]
+            raise Agent.AgentException(message=error_message) from eX
+
+        return self.Response(
+            role=response.role,
+            content=response.content,
+            input_tokens=response.usage.input_tokens,
+            output_tokens=response.usage.output_tokens,
+            finished=response.stop_reason == "end_turn",
+        )
 
     def install_service(self, name: str, role: str, direction: str, endpoint: str, tools: list[ToolParam]):
         """
@@ -280,12 +385,9 @@ class Agent:
                     answers: list[dict] = []
 
                     try:
-                        response = await self._api.messages.create(
-                            model=self.model,
-                            max_tokens=8192,
-                            system=[{
-                                "type": "text",
-                                "text": textwrap.dedent("""
+                        response = await self._invoke_api(
+                            system=Agent.SystemParam(
+                                text=textwrap.dedent("""
                                     You are a long-lived, general-purpose agent that can research,
                                     write code, run commands, and use connected tools to complete
                                     the user's task end to end. When you respond, brevity is very
@@ -302,29 +404,17 @@ class Agent:
                                 """).strip()
                                     + "\n\n"
                                     + "\n\n".join(runbook),
-                                "cache_control": {
-                                    "type": "ephemeral",
-                                    "ttl": "1h"
-                                },
-                            }],
-                            thinking={
-                                "type": "adaptive",
-                                "display": "summarized",
-                            },
-                            tools=[anthropic.types.ToolParam(
-                                name=tool.name,
-                                description=tool.description,
-                                input_schema=tool.input_schema,
-                            ) for tool in tooling + helps],
+                            ),
+                            tools=tooling + helps,
                             messages=context.history,
                         )
 
-                        context.write_tokens += response.usage.output_tokens
-                        context.input_tokens += response.usage.input_tokens
+                        context.write_tokens += response.output_tokens
+                        context.input_tokens += response.input_tokens
 
                         results = []
 
-                        for block in response.content:
+                        for block in response.blocks:
                             if block.type == "tool_use":
                                 if not block.name.startswith("help-"):
                                     result = await self._post_to_tool(
@@ -363,7 +453,7 @@ class Agent:
                                     "text": block.text,
                                 })
 
-                        if response.stop_reason == "end_turn":
+                        if response.finished:
                             looping = False
 
                         context.history.append({
@@ -379,15 +469,10 @@ class Agent:
                         else:
                             looping = False
 
-                    except anthropic.APIError as eX:
-                        error_message = eX.message
-                        if isinstance(eX.body, dict):
-                            error = eX.body.get("error")
-                            if isinstance(error, dict) and error.get("message"):
-                                error_message = error["message"]
+                    except Agent.AgentException as eX:
                         answers.append({
                             "type": "fail",
-                            "text": error_message,
+                            "text": eX.message,
                         })
                         looping = False
 
