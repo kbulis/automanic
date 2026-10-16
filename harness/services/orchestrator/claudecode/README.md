@@ -1,12 +1,10 @@
 # Orchestrator ClaudeCode
 
-Orchestration server for managing autonomous agents and context. Uses
-anthropic api with managed context and tooling.
+Orchestration server for managing autonomous agents and context. Runs headless claude code with per-session persistence, reaching registered tools through a local mcp proxy.
 
 ## What it does
 
-`orchestrator-claudecode` manages agent workflows as prompted through
-feedback service message events.
+`orchestrator-claudecode` manages agent workflows as prompted through feedback service message events.
 
 ## API
 
@@ -26,14 +24,14 @@ The service reads the following environment variables:
 | PORT         | Optional override, default = 8000 |
 | LOG_LEVEL    | Optional override, default = INFO |
 
-Note: AGENT_OAUTH_TOKEN is secret. Do **not** commit your claude code oauth token to source control.
+Note: AGENT_AUTH_TOKEN is secret. Do **not** commit your claude code oauth token to source control.
 
 ## Docker
 
 Pull the latest release:
 
 ```bash
-docker pull automanic/orchestrator-claudeapi:latest
+docker pull automanic/orchestrator-claudecode:latest
 ```
 
 ## Docker Compose with agents

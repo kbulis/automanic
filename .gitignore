@@ -6,5 +6,6 @@ dist
 .python-version
 .env
 .venv
+.agent
 .claude
 .mcp.json
