@@ -291,7 +291,7 @@ class Agent:
         then exits once stopping and the queue is empty.
         """
         
-        helps: list[Agent.ToolParam] = [Agent.ToolParam(
+        helping: list[Agent.ToolParam] = [Agent.ToolParam(
             name="help-request_feature",
             description="""
                 When encountering the need for a tool interaction that seems
@@ -412,7 +412,7 @@ class Agent:
                                         + "\n\n"
                                         + "\n\n".join(runbook),
                                 ),
-                                tools=tooling + helps,
+                                tools=tooling + helping,
                                 messages=context.history,
                             )
 
@@ -483,7 +483,7 @@ class Agent:
                         except RuntimeError as eX:
                             answers.append({
                                 "type": "fail",
-                                "text": str(eX),
+                                "text": str(eX) or type(eX).__name__,
                             })
                             looping = False
 
@@ -512,7 +512,7 @@ class Agent:
                             "message": {
                                 "parts": [{
                                     "type": "fail",
-                                    "text": str(eX),
+                                    "text": str(eX) or type(eX).__name__,
                                 }],
                             },
                         },
