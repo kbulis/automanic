@@ -418,6 +418,7 @@ class Agent:
 
             try:
                 with open(os.path.join(os.getcwd(), "CLAUDE.md"), "w", encoding="utf-8") as file:
+                    directions = [service.direction.strip() for service in current_toolbox if service.direction.strip() != ""]
                     file.write(
                         textwrap.dedent("""
                             You are a long-lived, general-purpose agent that can research,
@@ -433,14 +434,29 @@ class Agent:
                             Format agent responses as markdown (sans tables).
 
                             Orchestration policy playbook:
+
+                            # Help: Agent Policy
+
+                            Request capabilities that no connected tool provides.
+
+                            Use `help-request_feature` only after checking the
+                            available tools and finding none that can accomplish
+                            the step; do not use it for errors or outages of tools
+                            that exist (report those to the user instead).
+
+                            - `what`: the missing capability, in one short sentence
+                                (e.g. "send an email with an attachment").
+                            - `why`: the user goal it blocks, in one short sentence.
+
+                            The request is only logged for later review; it does not
+                            perform the action or return a workaround. After calling
+                            it, tell the user the capability is unavailable and has
+                            been requested, then finish whatever parts of the task
+                            you still can. Request each missing capability once per
+                            task.
                         """).strip()
-                            + "\n\n"
-                            + "\n\n".join([
-                                service.direction.strip()
-                                for service in current_toolbox
-                                if service.direction.strip() != "" and service.role != "feedback"
-                            ])
-                            + "\n"
+                        + "".join("\n\n" + direction for direction in directions)
+                        + "\n"
                     )
             except Exception:
                 log.exception(f"! unable to record latest system prompt")
