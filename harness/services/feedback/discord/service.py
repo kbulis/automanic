@@ -121,6 +121,12 @@ async def on_message(message: discord.Message):
 @client.event
 async def on_ready():
     log.info(f". connected as '{client.user.name.lower() if client.user else 'unknown'}'")
+    try:
+        await client.get_partial_messageable(int(channel_id)).send(
+            f"🤖 **{robot_name}**: logged in and ready 🦾",
+        )
+    except Exception:
+        log.exception("! failed to announce in channel")
 
 class ChannelPostResult(typing.TypedDict):
     message_id: str
@@ -245,7 +251,7 @@ def post_to_channel(session_id: str, message: Message) -> ChannelPostResult:
         if kind == "tool":
             text = f"{part['name']}\n{json.dumps(part.get('params', {}), indent=2)}"
         else:
-            text = part.get("text").strip() if part.get("text") else ""
+            text = part.get("text", "").strip() if part.get("text") else ""
         tokens: list[str] = []
         for line in text.splitlines(keepends=True):
             if len(render(kind, line.rstrip())) <= limit:
