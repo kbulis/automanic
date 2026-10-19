@@ -1,5 +1,4 @@
 __pycache__
-working
 build
 dist
 .pytest_cache
@@ -8,4 +7,5 @@ dist
 .venv
 .agent
 .claude
-.mcp.json
+.working
+.automanic

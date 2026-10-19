@@ -46,7 +46,13 @@ services:
       - "7002:8000"
     volumes:
       - type: bind
-        source: ./working
+        source: ./.automanic
+        target: /usr/local/share/automanic
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./.working
         target: /working
         bind:
           create_host_path: true
@@ -62,4 +68,4 @@ services:
     ports:
       - "7003:8000"
     volumes:
-      - ./working:/working
+      - ./.working:/working
