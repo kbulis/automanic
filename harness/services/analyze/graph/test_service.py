@@ -1194,21 +1194,27 @@ def test_related_follows_one_relationship(tmp_path):
 
 
 def test_get_source_reads_lines(tmp_path):
-    root = tmp_path / "src"
-    (root / "pkg").mkdir(parents=True)
-    (root / "pkg" / "mod.py").write_text("".join(f"line {n}\n" for n in range(1, 11)))
+    build(tmp_path, {
+        "pkg/mod.py": "".join(f"line {n}\n" for n in range(1, 11)),
+        "notes.md": "# Notes\n",
+    })
     (tmp_path / "secret.txt").write_text("no\n")
+    storage = str(tmp_path / "graph.sqlite")
 
-    found = service.get_source(str(root), "pkg/mod.py", 3, 5)
+    # Reads the tree the graph was built from, given the graph.
+    found = service.get_source(storage, "pkg/mod.py", 3, 5)
     assert (found["status"], found["start_line"], found["end_line"], found["lines"]) == ("ok", 3, 5, 10)
     assert found["source"] == "line 3\nline 4\nline 5" and not found["truncated"]
-    found = service.get_source(str(root), "pkg/mod.py", 8)
+    found = service.get_source(storage, "./pkg/mod.py", 8)
     assert (found["source"], found["end_line"], found["truncated"]) == ("line 8\nline 9\nline 10", 10, False)
-    found = service.get_source(str(root), "pkg/mod.py", 2, 9, max_lines=3)
+    found = service.get_source(storage, "pkg/mod.py", 2, 9, max_lines=3)
     assert (found["source"], found["end_line"], found["truncated"]) == ("line 2\nline 3\nline 4", 4, True)
+    # Files the graph doesn't parse too.
+    assert service.get_source(storage, "notes.md")["source"] == "# Notes"
 
     for args in (("pkg/mod.py", 11), ("pkg/mod.py", 5, 4), ("../secret.txt",), ("pkg/none.py",), ("pkg",)):
-        assert service.get_source(str(root), *args)["status"] == "failed", args
+        assert service.get_source(storage, *args)["status"] == "failed", args
+    assert service.get_source(str(tmp_path / "none.sqlite"), "pkg/mod.py")["status"] == "missing"
 
 
 def test_symbols_at_lines(tmp_path):
@@ -2263,3 +2269,285 @@ def test_go_packages_receivers_and_types(tmp_path):
     uses = edges(db, "USES")
     assert ("internal/store/store.go::Store.log", "internal/store/store.go::Logger") in uses
     assert ("internal/store/store.go::Store.Add", "internal/store/store.go::Item") in uses
+
+
+# 6. Terraform.
+
+def confidences(db: sqlite3.Connection, kind: str) -> dict[tuple[str, str], str]:
+    return {(s, d): c for s, d, c in db.execute("SELECT src_id, dst_id, confidence FROM edges WHERE kind = ?", (kind,))}
+
+
+def test_terraform_blocks_are_symbols_by_address(tmp_path):
+    db = build(tmp_path, {
+        "main.tf": """
+            # Network for the app.
+
+            # The shared vpc.
+            resource "aws_vpc" "main" {
+              cidr_block = var.cidr
+            }
+
+            provider "aws" {
+              region = var.region
+            }
+
+            provider "aws" {
+              alias = "west"
+            }
+
+            locals {
+              # Prefix of every name.
+              name = "${var.project}-${terraform.workspace}"
+            }
+
+            module "net" {
+              source = "./net"
+            }
+
+            data "aws_caller_identity" "current" {}
+        """,
+        "variables.tf": """
+            variable "cidr" {
+              description = "Range of the vpc."
+              default     = "10.0.0.0/16"
+            }
+            variable "region" {}
+            variable "project" {}
+        """,
+        "outputs.tf": """
+            output "vpc_id" {
+              value = aws_vpc.main.id
+            }
+        """,
+    })
+    found = symbols(db)
+    assert found["main.tf"] == ("file", None, "Network for the app.")
+    assert found["main.tf::aws_vpc.main"] == ("resource", 'resource "aws_vpc" "main"', "The shared vpc.")
+    assert found["main.tf::provider.aws"] == ("provider", 'provider "aws"', None)
+    assert found["main.tf::provider.aws.west"][0] == "provider"
+    assert found["main.tf::local.name"] == ("local", 'name = "${var.project}-${terraform.workspace}"', "Prefix of every name.")
+    assert found["main.tf::module.net"][0] == "module"
+    assert found["main.tf::data.aws_caller_identity.current"][0] == "data"
+    assert found["variables.tf::var.cidr"] == ("variable", 'variable "cidr"', "Range of the vpc.")
+    assert found["outputs.tf::output.vpc_id"][0] == "output"
+    # A module's interface is its variables and outputs.
+    exported = dict(db.execute("SELECT id, exported FROM symbols WHERE kind != 'file'"))
+    assert {i for i, e in exported.items() if e} == {
+        "variables.tf::var.cidr", "variables.tf::var.region", "variables.tf::var.project", "outputs.tf::output.vpc_id",
+    }
+    assert {"resource", "data", "local", "output", "module", "provider", "variable"} <= set(service.client._kinds_of_symbols)
+
+
+def test_terraform_references_resolve_in_their_module(tmp_path):
+    db = build(tmp_path, {
+        "main.tf": """
+            provider "aws" {}
+
+            provider "aws" {
+              alias = "west"
+            }
+
+            locals {
+              name  = "${var.project}-${terraform.workspace}"
+              zones = [for z in var.zones : upper(z)]
+            }
+
+            resource "aws_vpc" "main" {
+              cidr_block = var.cidr
+              tags = {
+                "kubernetes.io/cluster/${local.name}" = "shared"
+              }
+            }
+
+            resource "aws_subnet" "private" {
+              for_each   = toset(local.zones)
+              vpc_id     = aws_vpc.main.id
+              cidr_block = cidrsubnet(var.cidr, 8, index(local.zones, each.key))
+              provider   = aws.west
+            }
+
+            resource "aws_security_group" "web" {
+              vpc_id = aws_vpc.main.id
+              dynamic "ingress" {
+                for_each = var.ports
+                content {
+                  from_port = ingress.value
+                }
+              }
+              dynamic "egress" {
+                for_each = var.ports
+                iterator = port
+                content {
+                  to_port = port.value
+                }
+              }
+            }
+
+            data "aws_iam_policy_document" "assume" {
+              statement {
+                resources = [for s in aws_subnet.private : s.arn]
+                actions   = [var.missing]
+              }
+            }
+
+            resource "aws_iam_policy" "logs" {
+              policy = <<-EOT
+                log ${aws_vpc.main.arn} $${LITERAL}
+              EOT
+            }
+        """,
+        "variables.tf": """
+            variable "cidr" {}
+            variable "project" {}
+            variable "zones" {}
+            variable "ports" {}
+        """,
+        "outputs.tf": """
+            output "subnet_ids" {
+              value = values(aws_subnet.private)[*].id
+            }
+        """,
+    })
+    references = confidences(db, "REFERENCES")
+    # Addresses resolve exactly across the files of their directory, without
+    # the attributes after them, from object keys, indexes, and heredocs too.
+    for edge in [
+        ("main.tf::aws_vpc.main", "variables.tf::var.cidr"),
+        ("main.tf::aws_vpc.main", "main.tf::local.name"),
+        ("main.tf::local.name", "variables.tf::var.project"),
+        ("main.tf::local.zones", "variables.tf::var.zones"),
+        ("main.tf::aws_subnet.private", "main.tf::aws_vpc.main"),
+        ("main.tf::aws_subnet.private", "main.tf::local.zones"),
+        ("main.tf::aws_security_group.web", "variables.tf::var.ports"),
+        ("main.tf::data.aws_iam_policy_document.assume", "main.tf::aws_subnet.private"),
+        ("main.tf::aws_iam_policy.logs", "main.tf::aws_vpc.main"),
+        ("outputs.tf::output.subnet_ids", "main.tf::aws_subnet.private"),
+    ]:
+        assert references.get(edge) == "exact", edge
+    # Resources use the provider of their type's name, unless they name one.
+    assert ("main.tf::aws_vpc.main", "main.tf::provider.aws") in references
+    assert ("main.tf::aws_subnet.private", "main.tf::provider.aws.west") in references
+    assert ("main.tf::aws_subnet.private", "main.tf::provider.aws") not in references
+    # Iterators and terraform's own names aren't addresses, nor is what a
+    # heredoc escapes.
+    referenced = {f"{q}.{t}" for q, t in db.execute("SELECT qualifier, target FROM refs WHERE kind = 'REFERENCES'")}
+    assert not {name for name in referenced if name.split(".")[0] in ("z", "s", "ingress", "port", "each", "terraform", "LITERAL")}
+    # An undefined address has no edge.
+    assert "var.missing" in referenced
+    assert not [edge for edge in references if edge[1].endswith("var.missing")]
+
+
+def test_terraform_modules_reach_their_source(tmp_path):
+    db = build(tmp_path, {
+        "main.tf": """
+            module "net" {
+              source = "./modules/net"
+              cidr   = var.cidr
+            }
+
+            module "eks" {
+              source  = "terraform-aws-modules/eks/aws"
+              version = "20.0.0"
+              vpc_id  = module.net.vpc_id
+            }
+
+            variable "cidr" {}
+
+            output "vpc_id" {
+              value = module.net.vpc_id
+            }
+        """,
+        "modules/net/variables.tf": 'variable "cidr" {}\n',
+        "modules/net/main.tf": 'resource "aws_vpc" "this" {\n  cidr_block = var.cidr\n}\n',
+        "modules/net/outputs.tf": 'output "vpc_id" {\n  value = aws_vpc.this.id\n}\n',
+    })
+    # A local source imports every file of its directory.
+    assert {dst for src, dst in edges(db, "IMPORTS") if src == "main.tf"} == {
+        "modules/net/variables.tf", "modules/net/main.tf", "modules/net/outputs.tf",
+    }
+    references = confidences(db, "REFERENCES")
+    assert references[("main.tf::output.vpc_id", "main.tf::module.net")] == "exact"
+    # Through a module block, its outputs, and its arguments set its variables.
+    assert references[("main.tf::output.vpc_id", "modules/net/outputs.tf::output.vpc_id")] == "exact"
+    assert references[("main.tf::module.eks", "modules/net/outputs.tf::output.vpc_id")] == "exact"
+    assert references[("main.tf::module.net", "modules/net/variables.tf::var.cidr")] == "exact"
+    assert references[("modules/net/main.tf::aws_vpc.this", "modules/net/variables.tf::var.cidr")] == "exact"
+    # Registry sources are outside the graph.
+    assert service.get_file(str(tmp_path / "graph.sqlite"), "main.tf")["external_imports"] == ["terraform-aws-modules/eks/aws"]
+
+
+def test_terraform_remote_state_reads_the_stack_writing_it(tmp_path):
+    db = build(tmp_path, {
+        "network/backend.tf": """
+            terraform {
+              backend "s3" {
+                bucket               = "acme-state"
+                workspace_key_prefix = "acme/network"
+                key                  = "terraform.tfstate"
+              }
+            }
+        """,
+        "network/outputs.tf": 'output "vpc_id" {\n  value = "vpc-1"\n}\n',
+        "base/outputs.tf": 'output "zone" {\n  value = "z-1"\n}\n',
+        "app/main.tf": """
+            variable "project" {
+              default = "acme"
+            }
+
+            locals {
+              stage = terraform.workspace
+            }
+
+            data "terraform_remote_state" "network" {
+              backend = "s3"
+              config = {
+                bucket = "acme-state"
+                key    = "${var.project}/network/${local.stage}/terraform.tfstate"
+              }
+            }
+
+            data "terraform_remote_state" "elsewhere" {
+              backend = "s3"
+              config = {
+                bucket = "acme-state"
+                key    = "${var.project}/storage/${local.stage}/terraform.tfstate"
+              }
+            }
+
+            data "terraform_remote_state" "base" {
+              backend = "local"
+              config = {
+                path = "../base/terraform.tfstate"
+              }
+            }
+
+            resource "aws_instance" "web" {
+              subnet_id = data.terraform_remote_state.network.outputs.vpc_id
+              zone      = data.terraform_remote_state.base.outputs.zone
+            }
+        """,
+    })
+    # Where a stack's backend writes, with a variable at its default and any
+    # workspace, is what remote state reads; a stack without a backend writes
+    # locally.
+    imports = confidences(db, "IMPORTS")
+    assert {dst for src, dst in imports if src == "app/main.tf"} == {"network/backend.tf", "network/outputs.tf", "base/outputs.tf"}
+    assert {imports[edge] for edge in imports if edge[0] == "app/main.tf"} == {"inferred"}
+    references = confidences(db, "REFERENCES")
+    assert references[("app/main.tf::aws_instance.web", "network/outputs.tf::output.vpc_id")] == "inferred"
+    assert references[("app/main.tf::aws_instance.web", "base/outputs.tf::output.zone")] == "inferred"
+    assert references[("app/main.tf::aws_instance.web", "app/main.tf::data.terraform_remote_state.network")] == "exact"
+    # Readers of a stack lead where to start, ahead of the stacks they read.
+    storage = str(tmp_path / "graph.sqlite")
+    starts = [r["id"] for r in service.search_symbols(storage, "file", "", 10)["results"]]
+    assert starts[0] == "app/main.tf"
+    assert "network/outputs.tf" not in starts
+
+
+def test_terraform_files_arent_a_package_with_go(tmp_path):
+    db = build(tmp_path, {
+        "infra/main.tf": 'resource "aws_vpc" "main" {}\n',
+        "infra/main.go": "package infra\n\nfunc run() { aws_vpc.main() }\n",
+    })
+    # Files of one directory see each other's names only in one language.
+    assert not [edge for edge in edges(db, "CALLS") if edge[1].startswith("infra/main.tf")]

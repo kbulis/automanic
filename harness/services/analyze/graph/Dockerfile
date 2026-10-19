@@ -11,6 +11,7 @@ RUN pip install --quiet --no-cache-dir --root-user-action=ignore --upgrade pip &
     "tree-sitter-javascript==0.25.0" \
     "tree-sitter-typescript==0.23.2" \
     "tree-sitter-go==0.25.0" \
+    "tree-sitter-hcl==1.2.0" \
     "requests>=2,<3"
 
 COPY direction.md .

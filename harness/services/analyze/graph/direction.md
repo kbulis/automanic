@@ -17,9 +17,9 @@ answer points to.
 
 ## Rules
 
-1. For python, javascript, typescript (jsx, tsx), and go, use the graph to
-   find, outline, and relate code. Don't list, `cat`, or `grep` those
-   files through the shell.
+1. For python, javascript, typescript (jsx, tsx), go, and terraform, use
+   the graph to find, outline, and relate code. Don't list, `cat`, or
+   `grep` those files through the shell.
 2. Read signatures and docs before source. Read source by symbol
    (`get_context` with `include_source`) or by line range (`get_source`),
    never a whole file to find something in it.
@@ -90,6 +90,14 @@ connect.
   query="<fragment>")`.
 - Then `get_file` or `get_context` on the result, not `get_source` on the
   whole file.
+- Terraform symbols are named by address: `var.region`, `local.name`,
+  `aws_instance.web`, `data.aws_ami.ubuntu`, `module.vpc`,
+  `output.vpc_id`, with ids like `infra/main.tf::aws_instance.web`. A
+  module is a directory: its files reference each other's addresses, and
+  a module block reaches its source's outputs and variables. A stack
+  reading another's remote state imports it, and its references to that
+  stack's outputs are "inferred", as they depend on variables' defaults
+  and the workspace.
 
 ## Use case: from an error or a diff to the code
 
@@ -108,7 +116,9 @@ connect.
    `"referenced_by"` for functions passed as values (callbacks, handlers).
 3. For a changed signature of a method, `get_related(symbol_id,
    "overridden_by")`.
-4. For a file's exports, `get_dependents(file_path, depth=2)`.
+4. For a file's exports, `get_dependents(file_path, depth=2)`. For a
+   terraform variable or output, `get_related(symbol_id, "referenced_by",
+   depth=2)` reaches the modules and stacks that use it.
 5. Find the tests to run: `get_related(symbol_id, "tests", depth=3)`.
 6. After editing, `build_graph` again, then run those tests.
 
@@ -127,8 +137,8 @@ connect.
 - `cat file` to see what it holds: `get_file(file_path)`.
 - `cat file` or `sed -n` to read a function:
   `get_context(symbol_id, include_source=true)`.
-- `sed -n 'a,bp'` for other lines: `get_source(file_path, start_line,
-  end_line)`.
+- `sed -n 'a,bp'` for other lines: `get_source(path_to_storage,
+  file_path, start_line, end_line)`, for any file in the tree.
 - `grep -rn "def name"` or `grep -rn "class Name"`:
   `search_symbols(kind="any", query="Name")`.
 - `grep -rn "name("` for callers: `get_context` or

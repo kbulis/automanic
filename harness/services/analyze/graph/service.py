@@ -22,6 +22,7 @@ import tree_sitter_python
 import tree_sitter_javascript
 import tree_sitter_typescript
 import tree_sitter_go
+import tree_sitter_hcl
 import mcp.server.mcpserver
 
 # Set up logging for service.
@@ -102,7 +103,7 @@ class GraphClient:
     class LanguageSpec:
         name: str
         language: tree_sitter.Language
-        definitions: dict[str, str]                    # node type -> symbol kind
+        definitions: dict[str, str]                    # node type -> symbol kind; terraform's block type
         calls: dict[str, str]                          # node type -> field holding the callee
         imports: dict[str, str]                        # node type -> field holding the module
         separator: str                                 # module path separator in imports: "." or "/"
@@ -119,19 +120,19 @@ class GraphClient:
         object_values: list[str]                       # value node types that make a variable a namespace for its members
         receivers: dict[str, str]                      # definition node type -> field holding the receiver whose type qualifies it
         kinds_by_type: dict[str, str]                  # node type of a definition's "type" child -> kind, e.g. go's struct_type
-        packages: bool                                 # imports name directories under a go.mod module, whose files share names
+        packages: bool                                 # imports name directories, whose files share names: go's under a go.mod module, terraform's modules
         declarations: dict[str, tuple[str, str, str]]  # node type -> fields of its names, type, and values, "" if none
         constructors: list[str]                        # value node types that construct a type or call what returns one, e.g. `new Store()`
         self_names: list[str]                          # names for the enclosing class, e.g. `self`, `this`
         parameter_properties: list[str]                # node types marking a parameter as an attribute, e.g. ts's `private`
-        builtins: frozenset[str]                       # the language's own names, which bare calls mean unless defined, e.g. `len`
+        builtins: frozenset[str]                       # the language's own names, which bare calls mean unless defined, e.g. `len`; terraform's `each`
         builtin_methods: frozenset[str]                # methods of its own types, which calls on unknown values likely mean
         value_holders: dict[str, str]                  # node type -> field holding names used as values, "" for all children
         binders: dict[str, str]                        # node type -> field binding local names, "" for the node itself
         elements: list[str]                            # jsx element node types, whose capitalized names are components rendered
         embeddings: list[str]                          # node types that embed their type, when unnamed, as a base: go's `struct { *Base }`
         doc_types: bool                                # doc comments type what the code doesn't: jsdoc's `@param {Store} s`
-        visibility: str                                # how names are exported: "underscore" (python), "export" (ts, js), "capital" (go)
+        visibility: str                                # how names are exported: "underscore" (python), "export" (ts, js), "capital" (go), "interface" (terraform's variables and outputs)
 
     _languages: list[tuple[list[str], LanguageSpec]] = [
         ([".py"],
@@ -575,6 +576,52 @@ class GraphClient:
                 visibility="capital",
             )
         ),
+        ([".tf"],
+            LanguageSpec(
+                name="terraform",
+                language=tree_sitter.Language(tree_sitter_hcl.language()),
+                definitions={
+                    "resource": "resource",
+                    "data": "data",
+                    "variable": "variable",
+                    "locals": "local",
+                    "output": "output",
+                    "module": "module",
+                    "provider": "provider",
+                },
+                calls={},
+                imports={},
+                # Its own family, as no other language reaches its addresses;
+                # "//" marks a module source's subdirectory.
+                separator="//",
+                index_names=[],
+                inherits={},
+                imported_names={},
+                name_fields={},
+                function_values=[],
+                type_annotations=[],
+                import_calls=[],
+                decorators=[],
+                docstrings=False,
+                default_exports={},
+                object_values=[],
+                receivers={},
+                kinds_by_type={},
+                packages=True,
+                declarations={},
+                constructors=[],
+                self_names=[],
+                parameter_properties=[],
+                builtins=frozenset({"each", "count", "self", "path", "terraform"}),
+                builtin_methods=frozenset(),
+                value_holders={},
+                binders={},
+                elements=[],
+                embeddings=[],
+                doc_types=False,
+                visibility="interface",
+            )
+        ),
     ]
 
     # Symbol kinds the graph can hold; "file" is the outermost scope added by
@@ -594,14 +641,15 @@ class GraphClient:
         ".git",
         ".cache",
         "__pycache__",
-        ".venv",
         "venv",
+        ".venv",
         ".mypy_cache",
         ".pytest_cache",
+        ".terraform",
+        ".tox",
         "node_modules",
         "dist",
         "build",
-        ".tox",
     }
 
     # Test code, by its file's path: test directories, and names like
@@ -1115,14 +1163,20 @@ class GraphClient:
 
     def read_source(
         self,
-        path_to_analyze: str,
+        path_to_storage: str,
         file_path: str,
         start_line: int | None,
         end_line: int | None,
         max_lines: int,
     ) -> dict:
-        root = pathlib.Path(path_to_analyze).resolve()
-        path = (root / file_path.strip()).resolve()
+        # Read from the tree the graph was built from, as it is now.
+        meta = self.load_status_of(path_to_storage)
+        if meta["status"] == "missing":
+            return {"status": "missing"}
+        if "root" not in meta:
+            return {"status": "failed", "error": "the graph doesn't record its source tree; call build_graph again"}
+        root = pathlib.Path(str(meta["root"])).resolve()
+        path = (root / file_path.strip().removeprefix("./")).resolve()
         if not path.is_relative_to(root):
             return {"status": "failed", "error": f"outside {root}: {file_path}"}
         if not path.is_file():
@@ -2175,6 +2229,310 @@ class GraphClient:
         )
         return symbols, refs, bindings
 
+    # Arguments of terraform's blocks that aren't a module's inputs.
+    _meta_arguments: set[str] = {"source", "version", "providers", "count", "for_each", "depends_on"}
+
+    @classmethod
+    def _extract_terraform(
+        cls,
+        tree: tree_sitter.Tree,
+        rel_path: str,
+        spec: LanguageSpec,
+    ) -> tuple[list[tuple], list[tuple], list[tuple]]:
+        """
+        Symbols, raw refs, and bindings of a terraform file, as _extract's.
+        Blocks are symbols named by their address, `aws_instance.web`,
+        `var.region`, `module.vpc`, and each local is one. Their expressions
+        reference the addresses of their module, the files of their directory;
+        module blocks import their source, and reach the outputs and variables
+        in it, as remote state reaches the outputs of the stack writing it.
+        """
+
+        symbols: list[tuple] = []
+        refs: list[tuple] = []
+        bindings: list[tuple] = []
+        directory = pathlib.PurePosixPath(rel_path).parent.as_posix()
+
+        def text(node: tree_sitter.Node | None) -> str:
+            return node.text.decode("utf-8", errors="replace") if node is not None and node.text else ""
+
+        def body_of(node: tree_sitter.Node) -> tree_sitter.Node | None:
+            return next((c for c in node.named_children if c.type == "body"), None)
+
+        def attributes(node: tree_sitter.Node) -> dict[str, tree_sitter.Node]:
+            # A block's attributes, by name, to their value.
+            body = body_of(node)
+            return {
+                text(a.named_children[0]): a.named_children[-1]
+                for a in (body.named_children if body is not None else []) if a.type == "attribute" and len(a.named_children) == 2
+            }
+
+        def names_of(node: tree_sitter.Node | None) -> list[str]:
+            # The names a reference starts with, past indexes and up to a
+            # splat: `aws_instance.web[0].id` -> aws_instance, web, id.
+            if node is None or node.type != "expression" or not node.named_children or node.named_children[0].type != "variable_expr":
+                return []
+            names = [text(node.named_children[0])]
+            for child in node.named_children[1:]:
+                if child.type == "get_attr" and child.named_children:
+                    names.append(text(child.named_children[0]))
+                elif child.type != "index":
+                    break
+            return names
+
+        def template(node: tree_sitter.Node | None) -> str | None:
+            # A string's value with each interpolation as `${address}`, when
+            # it only interpolates variables, locals, and the workspace:
+            # `"${var.project}/state"`; None for other expressions.
+            if node is None:
+                return None
+            names = names_of(node)
+            if names:
+                simple = (names[0] in ("var", "local") and len(names) == 2) or names == ["terraform", "workspace"]
+                return f"${{{'.'.join(names)}}}" if simple else None
+            if node.type in ("expression", "template_expr", "literal_value") and len(node.named_children) == 1:
+                return template(node.named_children[0])
+            if node.type in ("numeric_lit", "bool_lit"):
+                return text(node)
+            if node.type not in ("string_lit", "quoted_template"):
+                return None
+            pieces = []
+            for child in node.named_children:
+                if child.type == "template_literal":
+                    pieces.append(text(child))
+                elif child.type == "template_interpolation":
+                    piece = template(next((c for c in child.named_children if c.type == "expression"), None))
+                    if piece is None:
+                        return None
+                    pieces.append(piece)
+                elif child.type not in ("quoted_template_start", "quoted_template_end"):
+                    return None
+            return "".join(pieces)
+
+        def elements(node: tree_sitter.Node | None) -> list[tuple[tree_sitter.Node | None, tree_sitter.Node | None]]:
+            # An object's keys and values: `{ bucket = "b" }`.
+            while node is not None and node.type in ("expression", "collection_value") and node.named_children:
+                node = node.named_children[0]
+            return [
+                (e.child_by_field_name("key"), e.child_by_field_name("val"))
+                for e in (node.named_children if node is not None and node.type == "object" else []) if e.type == "object_elem"
+            ]
+
+        def object_of(node: tree_sitter.Node | None) -> dict[str, str | None]:
+            # An object's values as templates, by key.
+            return {".".join(names_of(key)) or template(key) or "": template(value) for key, value in elements(node)}
+
+        def first_line(raw: bytes | str | None) -> str | None:
+            # First line with words, without comment markers or quotes.
+            raw = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else raw or ""
+            return next((line[:200] for line in (l.strip().strip("/*#'\"").strip() for l in raw.splitlines()) if line), None)
+
+        def comments_of(node: tree_sitter.Node) -> str | None:
+            # First line of the comments right above a block or attribute;
+            # those of the first in a body are above the body.
+            comments = cls._comments_above(node, spec)
+            if comments is None and node.prev_named_sibling is None and node.parent is not None and node.parent.type == "body":
+                comments = cls._comments_above(node.parent, spec)
+            return first_line(comments)
+
+        def reference(src_id: str, names: list[str], line: int):
+            # An address of the module, and through a module block or remote
+            # state, one in another: `module.vpc.vpc_id` -> module.vpc, and
+            # its source's output.vpc_id.
+            if names[0] == "data":
+                if len(names) < 3:
+                    return
+                address, rest = names[:3], names[3:]
+                if names[1] == "terraform_remote_state" and rest[:1] == ["outputs"] and len(rest) > 1:
+                    refs.append((src_id, "MODULE", f"output.{rest[1]}", rel_path, line, ".".join(address), None))
+            else:
+                address, rest = names[:2], names[2:]
+                if names[0] == "module" and rest:
+                    refs.append((src_id, "MODULE", f"output.{rest[0]}", rel_path, line, ".".join(address), None))
+            refs.append((src_id, "REFERENCES", address[-1], rel_path, line, ".".join(address[:-1]), None))
+
+        def provider(src_id: str, node: tree_sitter.Node | None, line: int):
+            # The provider a block names: `provider = aws.west`.
+            names = names_of(node)
+            if names:
+                refs.append((src_id, "REFERENCES", names[-1], rel_path, line, ".".join(("provider", *names[:-1])), None))
+
+        def walk(node: tree_sitter.Node, src_id: str, skipped: tuple[str, ...] = ()):
+            # References in a block, but its skipped attributes, or in an
+            # expression; not to names bound around them: iterators of `for`
+            # expressions, `[for s in aws_subnet.db : s.id]`, and of dynamic
+            # blocks.
+            pending: list[tuple[tree_sitter.Node, frozenset[str]]] = [(node, frozenset())]
+            if node.type == "block":
+                body = body_of(node)
+                pending = [
+                    (c, frozenset()) for c in (body.named_children if body is not None else [])
+                    if not (c.type == "attribute" and text(c.named_children[0]) in skipped)
+                ]
+            while pending:
+                node, bound = pending.pop()
+                names = names_of(node)
+                if names:
+                    if len(names) > 1 and names[0] not in spec.builtins and names[0] not in bound:
+                        reference(src_id, names, node.start_point.row + 1)
+                    pending += [(c, bound) for c in node.named_children[1:] if c.type == "index"]
+                    continue
+                if node.type in ("for_tuple_expr", "for_object_expr"):
+                    intro = next((c for c in node.named_children if c.type == "for_intro"), None)
+                    iterators = frozenset(text(c) for c in intro.named_children if c.type == "identifier") if intro else frozenset()
+                    for child in node.named_children:
+                        if child.type == "for_intro":
+                            pending += [(c, bound) for c in child.named_children if c.type != "identifier"]
+                        else:
+                            pending.append((child, bound | iterators))
+                    continue
+                if node.type == "block" and text(node.named_children[0]) == "dynamic":
+                    # `dynamic "ingress"` iterates as `ingress`, or as its
+                    # `iterator`.
+                    label = next((c for c in node.named_children[1:] if c.type in ("string_lit", "identifier")), None)
+                    iterator = attributes(node).get("iterator")
+                    bound = bound | {".".join(names_of(iterator)) if iterator is not None else (template(label) or text(label))}
+                pending += [(c, bound) for c in node.named_children]
+
+        # The file itself is the outermost scope, documented by its leading
+        # comments.
+        root = tree.root_node
+        symbols.append((rel_path, "file", rel_path, rel_path, rel_path, 1, root.end_point.row + 1, None, *cls._describe(root, spec), None))
+        prefixes = {"resource": "", "data": "data.", "variable": "var.", "output": "output.", "module": "module.", "provider": "provider."}
+        body = body_of(root)
+        for block in body.named_children if body is not None else []:
+            if block.type != "block":
+                continue
+            block_type = text(block.named_children[0])
+            labels = [template(c) or text(c) for c in block.named_children[1:] if c.type in ("string_lit", "identifier")]
+            attrs = attributes(block)
+            line = block.start_point.row + 1
+
+            inner = body_of(block)
+            nested = inner.named_children if inner is not None else []
+
+            if block_type == "locals":
+                for attribute in (c for c in nested if c.type == "attribute"):
+                    name = text(attribute.named_children[0])
+                    symbol_id = f"{rel_path}::local.{name}"
+                    symbols.append((
+                        symbol_id, "local", name, f"local.{name}", rel_path,
+                        attribute.start_point.row + 1, attribute.end_point.row + 1, rel_path,
+                        " ".join(text(attribute).split("\n", 1)[0].split())[:200], comments_of(attribute), False,
+                    ))
+                    value = template(attribute.named_children[-1])
+                    if value is not None:
+                        refs.append((symbol_id, "VALUE", value, rel_path, attribute.start_point.row + 1, None, None))
+                    walk(attribute.named_children[-1], symbol_id)
+                continue
+
+            if block_type == "terraform":
+                # Where the stack writes its state, for remote state reading
+                # it; backends of other kinds write it elsewhere.
+                for setting in (c for c in nested if c.type == "block" and text(c.named_children[0]) in ("backend", "cloud")):
+                    backend = next((template(c) or text(c) for c in setting.named_children[1:] if c.type in ("string_lit", "identifier")), "cloud")
+                    config = {name: template(value) for name, value in attributes(setting).items()}
+                    paths = cls._state_paths(backend, config, directory, None) or [(f"{backend}:", "")]
+                    refs.extend((rel_path, "BACKEND", path, rel_path, setting.start_point.row + 1, location, None) for location, path in paths)
+                continue
+
+            if block_type not in prefixes or len(labels) < (2 if block_type in ("resource", "data") else 1):
+                # Others, e.g. moved, import, and check blocks, reference
+                # addresses from their file.
+                walk(block, rel_path)
+                continue
+            if block_type in ("resource", "data"):
+                name, qualified = labels[1], f"{prefixes[block_type]}{labels[0]}.{labels[1]}"
+            elif block_type == "provider":
+                alias = template(attrs.get("alias"))
+                name, qualified = alias or labels[0], f"provider.{labels[0]}" + (f".{alias}" if alias else "")
+            else:
+                name, qualified = labels[0], f"{prefixes[block_type]}{labels[0]}"
+            symbol_id = f"{rel_path}::{qualified}"
+            start = next((c for c in block.children if c.type == "block_start"), block)
+            signature = " ".join(block.text[: start.start_byte - block.start_byte].decode("utf-8", errors="replace").split())[:200]
+            # Its description, or the comments above it.
+            doc = first_line(template(attrs.get("description"))) or comments_of(block)
+            exported = spec.visibility == "interface" and block_type in ("variable", "output")
+            symbols.append((
+                symbol_id, spec.definitions[block_type], name, qualified, rel_path, line, block.end_point.row + 1, rel_path,
+                signature, doc, exported,
+            ))
+
+            if block_type == "variable" and template(attrs.get("default")) is not None:
+                refs.append((symbol_id, "VALUE", template(attrs.get("default")), rel_path, line, None, None))
+            if block_type in ("resource", "data"):
+                # Resources and data use the provider their type is named
+                # after, `aws_instance` -> aws, unless they name one.
+                if "provider" in attrs:
+                    provider(symbol_id, attrs["provider"], attrs["provider"].start_point.row + 1)
+                else:
+                    refs.append((symbol_id, "REFERENCES", labels[0].split("_")[0], rel_path, line, "provider", None))
+                walk(block, symbol_id, skipped=("provider",))
+            elif block_type == "module":
+                # Its local source is imported, and bound to the module's
+                # name for reaching what's in it; its arguments are inputs,
+                # the variables of the same name in it.
+                source = template(attrs.get("source"))
+                if source and "${" not in source:
+                    refs.append((rel_path, "IMPORTS", source, rel_path, line, None, None))
+                    bindings.append((rel_path, qualified, source, None, line))
+                for argument, value in attrs.items():
+                    if argument not in cls._meta_arguments:
+                        refs.append((symbol_id, "MODULE", f"var.{argument}", rel_path, value.start_point.row + 1, qualified, None))
+                for _, value in elements(attrs.get("providers")):
+                    if value is not None:
+                        provider(symbol_id, value, value.start_point.row + 1)
+                walk(block, symbol_id, skipped=("source", "providers"))
+            else:
+                walk(block, symbol_id)
+
+            # Remote state reads the outputs of the stack writing it, by
+            # where its backend keeps state.
+            if block_type == "data" and labels[0] == "terraform_remote_state":
+                config = object_of(attrs.get("config"))
+                workspace = template(attrs.get("workspace")) or "default"
+                for location, path in cls._state_paths(template(attrs.get("backend")) or "", config, directory, workspace):
+                    refs.append((symbol_id, "STATE", path, rel_path, line, location, None))
+        return symbols, refs, bindings
+
+    @classmethod
+    def _state_paths(
+        cls,
+        backend: str,
+        config: dict[str, str | None],
+        directory: str,
+        workspace: str | None,
+    ) -> list[tuple[str, str]]:
+        """
+        Where a terraform backend keeps a workspace's state, as (location, path)
+        templates, or with no workspace, every workspace's, `*` for its name. s3
+        keeps the default workspace's at its `key`, others at
+        `<workspace_key_prefix>/<workspace>/<key>`; gcs at
+        `<prefix>/<workspace>.tfstate`; local at its `path` in the module's
+        directory, others at
+        `terraform.tfstate.d/<workspace>/terraform.tfstate`. Empty for other
+        backends, or a config they can't be found from.
+        """
+
+        bucket, key = config.get("bucket"), config.get("key")
+        if backend == "s3" and bucket and key:
+            location = f"s3:{bucket}"
+            default, named = key, f"{config.get('workspace_key_prefix') or 'env:'}/\0/{key}"
+        elif backend == "gcs" and bucket:
+            location = f"gcs:{bucket}"
+            named = "/".join(p for p in ((config.get("prefix") or "").strip("/"), "\0.tfstate") if p)
+            default = named.replace("\0", "default")
+        elif backend == "local":
+            location = "local:"
+            default = (pathlib.PurePosixPath(directory) / (config.get("path") or "terraform.tfstate")).as_posix()
+            named = (pathlib.PurePosixPath(directory) / "terraform.tfstate.d/\0/terraform.tfstate").as_posix()
+        else:
+            return []
+        if workspace is None:
+            return [(location, default), (location, named.replace("\0", "*"))]
+        return [(location, default if workspace == "default" else named.replace("\0", workspace))]
+
     @classmethod
     def _extract_all(
         cls,
@@ -2237,8 +2595,9 @@ class GraphClient:
                 # Logged first, so the last one names the file if the parser
                 # crashes the process.
                 log.debug(f". parsing {rel_path}")
+                extract = cls._extract_terraform if spec.name == "terraform" else cls._extract
                 try:
-                    symbols, refs, bindings = cls._extract(parsers[spec.name].parse(source), rel_path, spec)
+                    symbols, refs, bindings = extract(parsers[spec.name].parse(source), rel_path, spec)
                 except Exception:
                     log.exception(f"! failed to parse {rel_path}")
                     failed += 1
@@ -2323,10 +2682,11 @@ class GraphClient:
             "FROM symbols WHERE parent_id IS NOT NULL"
         )
 
-        # Package languages (go) group files by directory, and go.mod files map
-        # module paths to directories. Files of one family share import syntax,
-        # so can call each other: python, js and ts, or go.
-        packages: dict[str, set[str]] = {}
+        # Package languages (go, terraform) group files by language and
+        # directory, and go.mod files map module paths to directories. Files of
+        # one family share import syntax, so can call each other: python, js
+        # and ts, go, or terraform.
+        packages: dict[tuple[str, str], set[str]] = {}  # (language, directory) -> its files
         specs: dict[str, GraphClient.LanguageSpec] = {}
         for path in files:
             spec = next(
@@ -2336,9 +2696,12 @@ class GraphClient:
             if spec is not None:
                 specs[path] = spec
             if spec is not None and spec.packages:
-                packages.setdefault(pathlib.PurePosixPath(path).parent.as_posix(), set()).add(path)
+                packages.setdefault((spec.name, pathlib.PurePosixPath(path).parent.as_posix()), set()).add(path)
         modules: dict[str, str] = {}
-        for directory in {d for package in packages for d in (pathlib.PurePosixPath(package), *pathlib.PurePosixPath(package).parents)}:
+        for directory in {
+            d for language, package in packages if language == "go"
+            for d in (pathlib.PurePosixPath(package), *pathlib.PurePosixPath(package).parents)
+        }:
             manifest = root / directory / "go.mod"
             if has(directory, "go.mod"):
                 declaration = next((l for l in manifest.read_text(errors="replace").splitlines() if l.startswith("module ")), None)
@@ -2409,6 +2772,19 @@ class GraphClient:
             if spec is None:
                 continue
 
+            if spec.name == "terraform":
+                # Terraform: a module's local source is a directory, relative
+                # to the module calling it; registry and git sources have no
+                # edge.
+                if not target.startswith(("./", "../")):
+                    continue
+                directory = os.path.normpath(os.path.join(pathlib.PurePosixPath(file_path).parent, target))
+                for dst_id in sorted(packages.get((spec.name, directory), set())):
+                    imported.setdefault(file_path, set()).add(dst_id)
+                    module_files.setdefault((file_path, target), set()).add(dst_id)
+                    import_edges.append((src_id, dst_id, "IMPORTS", file_path, line, "exact"))
+                continue
+
             if spec.packages:
                 # Go: a module path from go.mod plus a directory in it; standard
                 # and external packages have no edge.
@@ -2416,7 +2792,7 @@ class GraphClient:
                 if module is None:
                     continue
                 directory = os.path.normpath(os.path.join(modules[module], target[len(module):].lstrip("/")))
-                for dst_id in sorted(packages.get(directory, set())):
+                for dst_id in sorted(packages.get((spec.name, directory), set())):
                     imported.setdefault(file_path, set()).add(dst_id)
                     module_files.setdefault((file_path, target), set()).add(dst_id)
                     import_edges.append((src_id, dst_id, "IMPORTS", file_path, line, "exact"))
@@ -2926,7 +3302,105 @@ class GraphClient:
                     called.add((src_id, method_id, line))
                     named_edges.append((src_id, method_id, "CALLS", file_path, line, "inferred"))
 
-        db.executemany("INSERT INTO edges VALUES (?, ?, ?, ?, ?, ?)", import_edges + named_edges)
+        terraform_edges = cls._terraform_edges(db, packages, module_files, bound, by_qualified)
+        db.executemany("INSERT INTO edges VALUES (?, ?, ?, ?, ?, ?)", import_edges + named_edges + terraform_edges)
+
+    @classmethod
+    def _terraform_edges(
+        cls,
+        db: sqlite3.Connection,
+        packages: dict[tuple[str, str], set[str]],
+        module_files: dict[tuple[str, str], set[str]],
+        bound: dict[tuple[str, str], list[tuple[str, str | None]]],
+        by_qualified: dict[tuple[str, str], tuple[str, str]],
+    ) -> list[tuple]:
+        """
+        Edges of terraform between modules: a module block references the
+        outputs and variables of its source, exactly; remote state imports the
+        stack whose backend writes where it reads, and references its outputs,
+        inferred, as where depends on variables' defaults and the workspace.
+        """
+
+        def directory_of(path: str) -> str:
+            return pathlib.PurePosixPath(path).parent.as_posix()
+
+        stacks = {directory: files for (language, directory), files in packages.items() if language == "terraform"}
+
+        # Templates of variables' defaults and of locals, by module and address,
+        # to evaluate where state is: `"${var.project}/${local.stage}"`.
+        values = {
+            (directory_of(file_path), src_id.partition("::")[2]): target
+            for src_id, target, file_path in db.execute("SELECT src_id, target, file_path FROM refs WHERE kind = 'VALUE'")
+        }
+
+        def evaluate(directory: str, template: str | None, depth: int = 0) -> str | None:
+            # A template's value, `*` for the workspace, or None when a value
+            # isn't known.
+            def substitute(match: re.Match) -> str:
+                if match[1] == "terraform.workspace":
+                    return "*"
+                value = values.get((directory, match[1]))
+                value = evaluate(directory, value, depth + 1) if depth < 8 else None
+                if value is None:
+                    raise LookupError(match[1])
+                return value
+
+            try:
+                return re.sub(r"\$\{([^}]*)\}", substitute, template) if template is not None else None
+            except LookupError:
+                return None
+
+        def located(directory: str, location: str | None, path: str | None) -> tuple[str, str] | None:
+            location, path = evaluate(directory, location), evaluate(directory, path)
+            if location is None or path is None:
+                return None
+            return location, os.path.normpath(path) if location == "local:" else path
+
+        # Where each stack writes state, as patterns of its workspaces; a stack
+        # without a backend writes it locally.
+        writers: list[tuple[str, re.Pattern, str]] = []  # (location, path pattern, directory)
+        backed: set[str] = set()
+        for target, file_path, qualifier in db.execute("SELECT target, file_path, qualifier FROM refs WHERE kind = 'BACKEND'"):
+            backed.add(directory_of(file_path))
+            found = located(directory_of(file_path), qualifier, target)
+            if found is not None and found[1]:
+                writers.append((found[0], re.compile(re.escape(found[1]).replace(r"\*", "[^/]+")), directory_of(file_path)))
+        for directory in sorted(stacks.keys() - backed):
+            for location, path in cls._state_paths("local", {}, directory, None):
+                writers.append((location, re.compile(re.escape(os.path.normpath(path)).replace(r"\*", "[^/]+")), directory))
+
+        # The files each module block and remote state reaches, by module and
+        # address, with how sure that is.
+        reaching: dict[tuple[str, str], tuple[set[str], str]] = {}
+        terraform_files = set().union(*stacks.values())
+        for (file_path, local), targets in bound.items():
+            if file_path in terraform_files and local.startswith("module."):
+                for module, _ in targets:
+                    reaching[(directory_of(file_path), local)] = (module_files.get((file_path, module), set()), "exact")
+        edges: list[tuple] = []
+        for src_id, target, file_path, line, qualifier in db.execute(
+            "SELECT src_id, target, file_path, line, qualifier FROM refs WHERE kind = 'STATE'"
+        ):
+            directory = directory_of(file_path)
+            found = located(directory, qualifier, target)
+            if found is None:
+                continue
+            # A workspace read as `*` may be any the writer has.
+            location, path = found
+            writing = sorted({d for l, pattern, d in writers if l == location and pattern.fullmatch(path.replace("*", "\0")) and d != directory})
+            files = set().union(*(stacks[d] for d in writing))
+            reaching[(directory, src_id.partition("::")[2])] = (files, "inferred")
+            edges += [(file_path, dst_id, "IMPORTS", file_path, line, "inferred") for dst_id in sorted(files)]
+
+        # `module.vpc.vpc_id` and `data.terraform_remote_state.net.outputs.id`
+        # reference outputs there, and module arguments its variables.
+        for src_id, target, file_path, line, qualifier in db.execute(
+            "SELECT src_id, target, file_path, line, qualifier FROM refs WHERE kind = 'MODULE'"
+        ):
+            files, confidence = reaching.get((directory_of(file_path), qualifier), (set(), "exact"))
+            for dst_id in sorted({by_qualified[(f, target)][0] for f in files if (f, target) in by_qualified}):
+                edges.append((src_id, dst_id, "REFERENCES", file_path, line, confidence))
+        return edges
 
     @classmethod
     def _path_aliases(
@@ -3255,11 +3729,12 @@ def build_graph(
     """
     Build or update a code graph of a source tree for subsequent analysis.
 
-    Parses python, javascript, typescript, and go files and stores their
-    symbols and the contains, calls (including rendering jsx components),
-    inherits (including implemented interfaces), overrides, uses (type
-    references), references (functions, classes, and constants used as
-    values), and imports edges between them. Call before querying a source
+    Parses python, javascript, typescript, go, and terraform files and
+    stores their symbols and the contains, calls (including rendering jsx
+    components), inherits (including implemented interfaces), overrides,
+    uses (type references), references (functions, classes, and constants
+    used as values; terraform's addresses, across modules and stacks
+    reading remote state), and imports edges between them. Call before querying a source
     tree and again after it changes; only changed files are parsed again. If
     status is "partial", call again to continue: what was parsed is kept,
     and edges are resolved once every file is, until then being the last
@@ -3463,9 +3938,9 @@ def get_context(
     what it depends on. Each related symbol's "confidence" is "exact"
     (resolved through definitions and imports), "inferred" (a method found
     through the type of what it's called on, e.g. `self.save()` or `s.add()`
-    after `s = Store()`, an override such a call may run, or a go type
-    having all of an interface's methods), or "guess" (matched by name only;
-    check these).
+    after `s = Store()`, an override such a call may run, a go type having
+    all of an interface's methods, or a terraform stack's output read
+    through remote state), or "guess" (matched by name only; check these).
 
     Args:
         path_to_storage: Full path to the sqlite database file given to
@@ -3482,7 +3957,8 @@ def get_context(
         "kind", "qualified_name", "file_path", "start_line", "end_line",
         "signature", and "doc", whether it is "exported" (usable from other
         files: python's names without a leading underscore or in `__all__`,
-        ts's exports and members not private, go's capitalized names) and
+        ts's exports and members not private, go's capitalized names,
+        terraform's variables and outputs) and
         "test" code, whether its file is "stale" (changed since the build),
         its "parent" and "members", whether each is "exported",
         the "callers", "callees", "bases", "subclasses", "uses", "used_by",
@@ -3615,9 +4091,9 @@ def get_related(
     Each result's "confidence" is its surest path's least sure edge:
     "exact" (resolved through definitions and imports), "inferred" (a
     method found through the type of what it's called on, e.g. `self.save()`
-    or `s.add()` after `s = Store()`, an override such a call may run, or a
-    go type having all of an interface's methods), or "guess" (matched by
-    name only).
+    or `s.add()` after `s = Store()`, an override such a call may run, a go
+    type having all of an interface's methods, or a terraform stack's
+    output read through remote state), or "guess" (matched by name only).
     Guesses multiply with depth; use skip_guesses to follow only the others.
 
     Args:
@@ -3643,7 +4119,7 @@ def get_related(
 
     # Each relationship as (edge kinds, whether it follows edges from the
     # symbol).
-    relationships = {
+    relationships: dict[str, tuple[tuple[str, ...], bool]] = {
         "callers": (("CALLS",), False),
         "callees": (("CALLS",), True),
         "bases": (("INHERITS",), True),
@@ -3667,35 +4143,39 @@ def get_related(
 
 @mcp.tool()
 def get_source(
-    path_to_analyze: str,
+    path_to_storage: str,
     file_path: str,
     start_line: int | None = None,
     end_line: int | None = None,
     max_lines: int = 256,
 ) -> dict:
     """
-    Read lines of a file in an analyzed source tree as it is now.
+    Read lines of a file in the source tree of a code graph, as it is now.
 
     Use for lines around a symbol or anything outside one; get_context
-    includes a symbol's own source.
+    includes a symbol's own source. Any file in the tree can be read, not
+    only those the graph parses.
 
     Args:
-        path_to_analyze: Directory of the source tree given to build_graph
-        file_path: Path of the file relative to that directory
+        path_to_storage: Full path to the sqlite database file given to
+            build_graph
+        file_path: Path of the file relative to the analyzed root, as in a
+            file symbol's "id"
         start_line: First line to read, from 1; the start of the file if
             not given
         end_line: Last line to read; max_lines from start_line if not given
         max_lines: Most lines to read
 
     Returns:
-        A dict whose "status" is "ok" or "failed" (see "error"), with the
-        "file_path", the "start_line" and "end_line" read, the file's
+        A dict whose "status" is "ok", "missing" (no graph at
+        path_to_storage; call build_graph), or "failed" (see "error"), with
+        the "file_path", the "start_line" and "end_line" read, the file's
         "lines" count, the "source", and whether it was "truncated" by
         max_lines
     """
 
     try:
-        return client.read_source(path_to_analyze, file_path, start_line, end_line, max_lines)
+        return client.read_source(path_to_storage, file_path, start_line, end_line, max_lines)
     except Exception as ex:
         log.exception("! failed to get source")
         return {"status": "failed", "error": str(ex)}

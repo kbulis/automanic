@@ -13,8 +13,9 @@ MCP service for autonomous agents to efficiently organize and analyze code bases
 - Find the symbols at a file's lines, e.g. from a stack trace or a diff hunk
 - Follow those relationships to find what a change can break and which tests reach it
 - Read source lines of a symbol or file
+- Trace terraform addresses across files, modules, and stacks that read each other's remote state
 
-Supported languages: python, javascript, typescript (including jsx and tsx), and go.
+Supported languages: python, javascript, typescript (including jsx and tsx), go, and terraform.
 
 ## Configuration
 
