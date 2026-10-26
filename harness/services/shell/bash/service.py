@@ -1,5 +1,6 @@
 import os
 import sys
+import pip
 import time
 import dataclasses
 import subprocess
@@ -296,6 +297,8 @@ if __name__ == "__main__":
     . 
     . powered by automanic 🍣
     . """))
+
+    log.info(f". python: {sys.version.split()[0]}, pip: {pip.__version__}")
 
     if not registry_url:
         log.error("! registry url not configured, exiting")

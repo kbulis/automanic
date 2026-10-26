@@ -1,6 +1,7 @@
 import typing
 import os
 import sys
+import pip
 import asyncio
 import threading
 import dataclasses
@@ -650,6 +651,8 @@ if __name__ == "__main__":
     . 
     . powered by automanic 🍣
     . """))
+
+    log.info(f". python: {sys.version.split()[0]}, pip: {pip.__version__}")
 
     log.info(f". orchestrating")
 

@@ -1,9 +1,10 @@
 FROM debian:trixie-slim
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+    ca-certificates \
     curl \
     wget \
-    ca-certificates \
     gnupg \
     zip \
     unzip \
@@ -15,7 +16,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     procps \
     python3 \
     python3-pip \
-    python3-venv
+    python3-venv \
+    && apt-get upgrade -y ca-certificates
 
 RUN curl -fsSL https://deb.nodesource.com/setup_24.x | bash - \
     && apt-get install -y --no-install-recommends nodejs
@@ -28,6 +30,7 @@ RUN python3 -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
 RUN pip install --no-cache-dir --root-user-action=ignore --upgrade pip && pip install --no-cache-dir --root-user-action=ignore \
+    "certifi>=2026.10.19" \
     "mcp>=2,<3" \
     "requests>=2,<3" \
     "ipython" \
