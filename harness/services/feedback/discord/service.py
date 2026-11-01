@@ -238,7 +238,7 @@ def post_to_channel(session_id: str, message: Message) -> ChannelPostResult:
 
     def render(kind: str, text: str) -> str:
         if kind == "tool":
-            return f"```\n{text}\n```"
+            return f"```\n{text.replace('`', '\'')}\n```"
         if kind == "idea":
             return "\n".join(f"> {line}" for line in f"*{text}*".split("\n"))
         if kind == "fail":
@@ -250,7 +250,7 @@ def post_to_channel(session_id: str, message: Message) -> ChannelPostResult:
     for part in message.get("parts") or [{"type": "text", "text": "..."}]:
         kind = part["type"]
         if kind == "tool":
-            text = f"{part['name']}\n{json.dumps(part.get('params', {}), indent=2)}"
+            text = f"{part.get('name', 'unspecified')}\n{json.dumps(part.get('params', {}), indent=2)}"
         else:
             text = part.get("text", "").strip() if part.get("text") else ""
         tokens: list[str] = []
@@ -272,11 +272,11 @@ def post_to_channel(session_id: str, message: Message) -> ChannelPostResult:
     chunks = [f"🤖 **{robot_name}**:"]
 
     for content in sends:
-        if len(chunks[-1]) + len("\n\n") + len(content) > limit:
+        content_sep = "\n" if chunks[-1].endswith("```") else "\n\n"
+        if len(chunks[-1]) + len(content_sep) + len(content) > limit:
             chunks.append(content)
         else:
-            chunks[-1] += "\n\n" + content
-
+            chunks[-1] += content_sep + content
     message_id = ""
 
     with api_error_wrapper():
