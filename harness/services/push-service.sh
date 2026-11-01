@@ -102,9 +102,9 @@ done
 echo ". building ${VERSION_TAG}"
 
 if [[ "${LATEST}" == true ]]; then
-    docker build -f "${SERVICE}/Dockerfile" -t "${VERSION_TAG}" -t "${LATEST_TAG}" "${SERVICE}"
+    docker build --pull -f "${SERVICE}/Dockerfile" -t "${VERSION_TAG}" -t "${LATEST_TAG}" "${SERVICE}"
 else
-    docker build -f "${SERVICE}/Dockerfile" -t "${VERSION_TAG}" "${SERVICE}"
+    docker build --pull -f "${SERVICE}/Dockerfile" -t "${VERSION_TAG}" "${SERVICE}"
 fi
 
 # ------------------------------------------------------------
